@@ -278,9 +278,9 @@ int AiColumnService::install_table(uint64_t table_id, bool initialize_rows)
   {
     ObSchemaGetterGuard fast_guard;
     const ObTableSchema *fast_table = nullptr;
-    int fast_ret = OB_SUCCESS;
-    if (OB_FAIL(fast_ret = GCTX.schema_service_->get_runtime_schema_guard(fast_guard))) return fast_ret;
-    if (OB_FAIL(fast_ret = fast_guard.get_table_schema(table_id, fast_table))) return fast_ret;
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(fast_guard))) return ret;
+    if (OB_FAIL(fast_guard.get_table_schema(table_id, fast_table))) return ret;
     if (!fast_table) return OB_TABLE_NOT_EXIST;
     bool has_ai = false;
     for (int64_t i = 0; i < fast_table->get_column_count(); ++i) {
@@ -447,7 +447,7 @@ int AiColumnService::install_table(uint64_t table_id, bool initialize_rows)
 int AiColumnService::recover()
 {
   if (!GCTX.sql_proxy_ || !GCTX.schema_service_) return OB_NOT_INIT;
-  if (!GCTX.schema_service_->is_runtime_schema_refreshed()) return OB_EAGAIN;
+  if (!GCTX.sys_package_ready_) return OB_EAGAIN;
   int ret = OB_SUCCESS;
   ObSEArray<uint64_t, 8> ai_table_ids;
   {

@@ -47,7 +47,7 @@ private:
 private:
   bool inited_;
   int64_t fail_count_;
-  static const int64_t SCHEDULE_INTERVAL_US = 3 * 1000 * 1000L; // 3s
+  static const int64_t SCHEDULE_INTERVAL_US = 300 * 1000L; // 300ms
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSystemPackageLoadTask);

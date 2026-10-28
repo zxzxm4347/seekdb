@@ -5308,9 +5308,26 @@ int ObResolverUtils::wait_for_sys_package_ready(ObSQLSessionInfo &session_info)
   int ret = OB_SUCCESS;
   if (config::_enable_async_load_sys_package() && !GCTX.sys_package_ready_
       && session_info.is_user_session() && share::server_is_write_enabled()) {
-    const int64_t retry_interval_us = 100L * 1000L; // 100ms
+    const int64_t retry_interval_us = 50L * 1000L; // 50ms
+    const int64_t wait_start_ts = ObTimeUtility::current_time();
+    const int64_t max_wait_us = 60L * 1000L * 1000L; // 60s
+    int64_t query_timeout = 10000000L;
+    (void)session_info.get_query_timeout(query_timeout);
+    if (query_timeout < 10000000L) {
+      query_timeout = 10000000L;
+    }
     bool waited = false;
     while (!GCTX.sys_package_ready_ && OB_SUCC(ret)) {
+      const int64_t now = ObTimeUtility::current_time();
+      if (now - wait_start_ts < max_wait_us) {
+        session_info.set_query_start_time(now);
+        THIS_WORKER.set_timeout_ts(now + query_timeout);
+        if (NULL != session_info.get_cur_exec_ctx()
+            && NULL != session_info.get_cur_exec_ctx()->get_physical_plan_ctx()) {
+          session_info.get_cur_exec_ctx()->get_physical_plan_ctx()->set_timeout_timestamp(
+              now + query_timeout);
+        }
+      }
       if (NULL != session_info.get_cur_exec_ctx() && OB_FAIL(session_info.get_cur_exec_ctx()->check_status())) {
       } else {
         if (!waited) {
@@ -5324,6 +5341,14 @@ int ObResolverUtils::wait_for_sys_package_ready(ObSQLSessionInfo &session_info)
     } else if (!GCTX.sys_package_ready_) {
       LOG_WARN("sys package not ready after waiting");
     } else {
+      const int64_t now = ObTimeUtility::current_time();
+      session_info.set_query_start_time(now);
+      THIS_WORKER.set_timeout_ts(now + query_timeout);
+      if (NULL != session_info.get_cur_exec_ctx()
+          && NULL != session_info.get_cur_exec_ctx()->get_physical_plan_ctx()) {
+        session_info.get_cur_exec_ctx()->get_physical_plan_ctx()->set_timeout_timestamp(
+            now + query_timeout);
+      }
       if (waited) {
         LOG_INFO("sys package ready after waiting");
       }

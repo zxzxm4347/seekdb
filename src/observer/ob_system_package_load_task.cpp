@@ -90,8 +90,14 @@ int ObSystemPackageLoadTask::load_system_package_()
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(GET_ADMIN_JOB_COUNT(LOAD_MYSQL_SYS_PACKAGE, job_count))) {
   } else if (0 == job_count) {
-    // job not exists, try insert inprogress job
+    // job not exists, try insert inprogress job and load immediately
     if (OB_FAIL(ADMIN_JOB_CREATE_WITH_RET(job_id, JOB_TYPE_LOAD_MYSQL_SYS_PACKAGE))) {
+    } else if (OB_FAIL(pl::ObPLPackageManager::load_all_common_sys_package(
+                           *sql_proxy,
+                           false/*from_file*/))) {
+    } else if (OB_FAIL(ADMIN_JOB_COMPLETE(job_id, 0/*result_code*/))) {
+    } else {
+      GCTX.sys_package_ready_ = true;
     }
   } else if (OB_FAIL(ADMIN_JOB_FIND(LOAD_MYSQL_SYS_PACKAGE, job_id))) {
     if (ret == OB_ENTRY_NOT_EXIST) {
@@ -118,7 +124,8 @@ void ObSystemPackageLoadTask::runTimerTask()
   } else if (!share::server_is_write_enabled()) {
     LOG_INFO("read-only server skips loading sys package");
   } else if (GCTX.sys_package_ready_) {
-    LOG_INFO("sys package already loaded");
+    // already loaded
+  } else if (FALSE_IT(THIS_WORKER.set_timeout_ts(ObTimeUtility::current_time() + 120L * 1000L * 1000L))) {
   } else if (OB_FAIL(load_system_package_())) {
     fail_count_++;
     if (fail_count_ >= 5) {
