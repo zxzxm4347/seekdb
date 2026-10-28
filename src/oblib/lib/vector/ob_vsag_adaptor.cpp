@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <pthread.h>
 #include "vsag/vsag.h"
 #include "vsag/errors.h"
@@ -86,14 +87,100 @@ struct ObCuvsEntry {
   std::vector<float> buf_vecs_; // accumulated vectors (row-major) from add_index
   std::vector<int64_t> buf_ids_;// accumulated external vids from add_index
   size_t built_n_ = 0;          // #vectors present when cuVS was last (re)built
+  uint64_t last_graph_bytes_ = 0;
   bool vsag_ready_ = false;     // CPU fallback is built only when it is needed
 };
 static std::mutex g_ob_cuvs_mu;
 static std::map<void *, ObCuvsEntry *> g_ob_cuvs_reg;
 static std::mutex g_ob_cuvs_marked_mu;
 static std::set<void *> g_ob_cuvs_marked;  // handles of lib=cuvs indexes (marked by the plugin)
+static std::atomic<void *> g_ob_cuvs_last_marked_key{nullptr};
 // Serializes lazy VSAG fallback builds so concurrent queries never Build() one index twice.
 static std::mutex g_ob_cuvs_fallback_mu;
+
+// Persistent 32MB-stack worker thread to avoid per-query/per-build pthread_create + mmap overhead.
+struct ObCuvsWorker {
+  pthread_mutex_t mu_ = PTHREAD_MUTEX_INITIALIZER;
+  pthread_cond_t cv_req_ = PTHREAD_COND_INITIALIZER;
+  pthread_cond_t cv_done_ = PTHREAD_COND_INITIALIZER;
+  pthread_t tid_{};
+  bool started_ = false;
+  bool busy_ = false;
+  void *(*fn_)(void *) = nullptr;
+  void *arg_ = nullptr;
+
+  static void *thread_main(void *self_ptr) {
+    ObCuvsWorker *self = static_cast<ObCuvsWorker *>(self_ptr);
+    pthread_mutex_lock(&self->mu_);
+    for (;;) {
+      while (self->fn_ == nullptr) {
+        pthread_cond_wait(&self->cv_req_, &self->mu_);
+      }
+      void *(*fn)(void *) = self->fn_;
+      void *arg = self->arg_;
+      self->fn_ = nullptr;
+      self->arg_ = nullptr;
+      pthread_mutex_unlock(&self->mu_);
+      (void)fn(arg);
+      pthread_mutex_lock(&self->mu_);
+      self->busy_ = false;
+      pthread_cond_broadcast(&self->cv_done_);
+    }
+    return nullptr;
+  }
+
+  bool run(void *(*fn)(void *), void *arg) {
+    pthread_mutex_lock(&mu_);
+    // Re-entrancy guard: if already on the 32MB worker thread, execute inline to prevent self-deadlock.
+    if (started_ && pthread_equal(pthread_self(), tid_)) {
+      pthread_mutex_unlock(&mu_);
+      (void)fn(arg);
+      return true;
+    }
+    if (!started_) {
+      pthread_attr_t attr;
+      if (pthread_attr_init(&attr) == 0) {
+        pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&tid_, &attr, &ObCuvsWorker::thread_main, this) == 0) {
+          started_ = true;
+        }
+        pthread_attr_destroy(&attr);
+      }
+      if (!started_) {
+        pthread_mutex_unlock(&mu_);
+        return false;
+      }
+    }
+    while (busy_) {
+      pthread_cond_wait(&cv_done_, &mu_);
+    }
+    busy_ = true;
+    fn_ = fn;
+    arg_ = arg;
+    pthread_cond_signal(&cv_req_);
+    while (busy_) {
+      pthread_cond_wait(&cv_done_, &mu_);
+    }
+    pthread_mutex_unlock(&mu_);
+    return true;
+  }
+};
+static ObCuvsWorker g_ob_cuvs_worker;
+
+static bool ob_cuvs_run_big_stack(void *(*fn)(void *), void *arg) {
+  if (g_ob_cuvs_worker.run(fn, arg)) {
+    return true;
+  }
+  pthread_t tid;
+  pthread_attr_t attr;
+  if (pthread_attr_init(&attr) != 0) { return false; }
+  int rc = pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+  if (rc == 0) { rc = pthread_create(&tid, &attr, fn, arg); }
+  pthread_attr_destroy(&attr);
+  return rc == 0 && pthread_join(tid, nullptr) == 0;
+}
+
 // GPU backend available? (used by the explicit dbms_vector.batch_knn path)
 static inline bool ob_cuvs_enabled() {
 #ifdef OB_BUILD_CUVS
@@ -105,8 +192,14 @@ static inline bool ob_cuvs_enabled() {
 // Per-index opt-in: the plugin marks a handle when its index was declared lib=cuvs.
 static inline bool ob_cuvs_marked(void *key) {
 #ifdef OB_BUILD_CUVS
+  if (key == nullptr) { return false; }
+  if (g_ob_cuvs_last_marked_key.load(std::memory_order_relaxed) == key) { return true; }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
-  return g_ob_cuvs_marked.find(key) != g_ob_cuvs_marked.end();
+  if (g_ob_cuvs_marked.find(key) != g_ob_cuvs_marked.end()) {
+    g_ob_cuvs_last_marked_key.store(key, std::memory_order_relaxed);
+    return true;
+  }
+  return false;
 #else
   (void)key; return false;
 #endif
@@ -143,13 +236,10 @@ static void *ob_cuvs_build_job(void *arg) {
   j->out = seekdb_cuvs_build(j->base, j->n, j->dim);
   return nullptr;
 }
-// cuVS overflows the small OB worker/DDL stack, so builds run on a 32MB pthread.
+// cuVS overflows the small OB worker/DDL stack, so builds run on the 32MB worker thread.
 static std::shared_ptr<void> ob_cuvs_build_big_stack(const float *base, long n, long dim) {
   ObCuvsBuildJob job{base, n, dim, nullptr};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_build_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  (void)ob_cuvs_run_big_stack(ob_cuvs_build_job, &job);
   return ob_cuvs_wrap(job.out);
 }
 static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids,
@@ -168,25 +258,39 @@ static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids
 // Buffer vectors arriving via add_index. Plain HNSW builds BOTH its delta and its
 // snapshot incrementally via add_index (one row at a time), so this is where the
 // real data flows -- unlike build_index which is only used by the HNSW_SQ bulk path.
-static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
-                        int dim, int size) {
-  if (vectors == nullptr || ids == nullptr || dim <= 0 || size <= 0) { return; }
+static bool ob_cuvs_add_and_check_skip_vsag(void *key, const float *vectors, const int64_t *ids,
+                                            int dim, int size) {
+  if (vectors == nullptr || ids == nullptr || dim <= 0 || size <= 0) { return false; }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
-  if (slot == nullptr) { slot = new ObCuvsEntry(); slot->dim_ = dim; }
+  if (slot == nullptr) {
+    slot = new ObCuvsEntry();
+    slot->dim_ = dim;
+  }
   if (slot->dim_ == 0) { slot->dim_ = dim; }
-  if (slot->dim_ != dim) { return; }
+  if (slot->dim_ != dim) { return false; }
+  const size_t cur_n = slot->buf_ids_.size();
+  const size_t next_n = cur_n + static_cast<size_t>(size);
+  if (next_n > slot->buf_ids_.capacity()) {
+    size_t new_cap = slot->buf_ids_.capacity() ? slot->buf_ids_.capacity() * 2 : 1024;
+    if (next_n > 256 && new_cap < 262144) { new_cap = 262144; }
+    if (new_cap < next_n) { new_cap = next_n; }
+    slot->buf_ids_.reserve(new_cap);
+    slot->buf_vecs_.reserve(new_cap * static_cast<size_t>(dim));
+  }
   slot->buf_vecs_.insert(slot->buf_vecs_.end(), vectors,
                          vectors + static_cast<size_t>(dim) * size);
   slot->buf_ids_.insert(slot->buf_ids_.end(), ids, ids + size);
-}
-static bool ob_cuvs_vsag_ready(void *key) {
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
-  auto it = g_ob_cuvs_reg.find(key);
-  return it != g_ob_cuvs_reg.end() && it->second->vsag_ready_;
+  return !slot->vsag_ready_;
 }
 static void ob_cuvs_erase(void *key) {
-  { std::lock_guard<std::mutex> mg(g_ob_cuvs_marked_mu); g_ob_cuvs_marked.erase(key); }
+  {
+    std::lock_guard<std::mutex> mg(g_ob_cuvs_marked_mu);
+    if (g_ob_cuvs_last_marked_key.load(std::memory_order_relaxed) == key) {
+      g_ob_cuvs_last_marked_key.store(nullptr, std::memory_order_relaxed);
+    }
+    g_ob_cuvs_marked.erase(key);
+  }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   auto it = g_ob_cuvs_reg.find(key);
   if (it != g_ob_cuvs_reg.end()) {
@@ -206,7 +310,10 @@ static void *ob_cuvs_job(void *arg) {
     void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
                                  static_cast<long>(j->dim));
     if (nb != nullptr) {
-      j->ent->bridge_ = ob_cuvs_wrap(nb); j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
+      j->ent->bridge_ = ob_cuvs_wrap(nb);
+      j->ent->built_n_ = j->n;
+      j->ent->ids_ = j->ent->buf_ids_;
+      j->ent->last_graph_bytes_ = 0;
       j->built_ = true;
     }
   }
@@ -233,7 +340,10 @@ static void *ob_cuvs_batch_job(void *arg) {
     void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
                                  static_cast<long>(j->ent->dim_));
     if (nb != nullptr) {
-      j->ent->bridge_ = ob_cuvs_wrap(nb); j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
+      j->ent->bridge_ = ob_cuvs_wrap(nb);
+      j->ent->built_n_ = j->n;
+      j->ent->ids_ = j->ent->buf_ids_;
+      j->ent->last_graph_bytes_ = 0;
       j->built_ = true;
     }
   }
@@ -276,17 +386,14 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   ObCuvsEntry *ent = it->second;
   // Lazily (re)build the GPU CAGRA index when there are enough points and either
   // nothing is built yet or the buffer grew materially (>=2x). Build+search run on
-  // a 32MB-stack pthread (cuVS overflows the OB worker stack otherwise).
+  // a 32MB-stack worker thread (cuVS overflows the OB worker stack otherwise).
   const size_t n = ent->buf_ids_.size();
   const bool need_build =
       (n >= OB_CUVS_MIN_PTS && (ent->bridge_ == nullptr || n >= ent->built_n_ * 2));
   std::vector<unsigned> off(topk);
   std::vector<float> dst(topk);
   ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  (void)ob_cuvs_run_big_stack(ob_cuvs_job, &job);
   if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
   if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
   // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter
@@ -322,9 +429,19 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
 
 static const char OB_CUVS_SNAPSHOT_MAGIC[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '2'};
 struct ObCuvsSnapshotFile {
-  FILE *file_ = ::tmpfile();
+  FILE *file_ = nullptr;
   char path_[64] = {};
   ObCuvsSnapshotFile() {
+    char shm_tpl[] = "/dev/shm/ob_cuvs_XXXXXX";
+    int fd = ::mkstemp(shm_tpl);
+    if (fd >= 0) {
+      ::unlink(shm_tpl);
+      file_ = ::fdopen(fd, "w+b");
+      if (file_ == nullptr) { ::close(fd); }
+    }
+    if (file_ == nullptr) {
+      file_ = ::tmpfile();
+    }
     if (file_ != nullptr) {
       ::snprintf(path_, sizeof(path_), "/proc/self/fd/%d", ::fileno(file_));
     }
@@ -347,13 +464,7 @@ static void *ob_cuvs_snapshot_job(void *arg) {
   return nullptr;
 }
 static bool ob_cuvs_snapshot_big_stack(ObCuvsSnapshotJob &job) {
-  pthread_t thread;
-  pthread_attr_t attr;
-  if (pthread_attr_init(&attr) != 0) { return false; }
-  int rc = pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (rc == 0) { rc = pthread_create(&thread, &attr, ob_cuvs_snapshot_job, &job); }
-  pthread_attr_destroy(&attr);
-  return rc == 0 && pthread_join(thread, nullptr) == 0 && job.rc_ == 0;
+  return ob_cuvs_run_big_stack(ob_cuvs_snapshot_job, &job) && job.rc_ == 0;
 }
 
 static bool ob_cuvs_write(std::ostream &out, const void *data, size_t bytes) {
@@ -414,6 +525,7 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
   }
   const uint64_t graph_bytes = static_cast<uint64_t>(::ftello(graph.file_));
   ::rewind(graph.file_);
+  ent->last_graph_bytes_ = graph_bytes;
   const int64_t build_us = ObTimeUtility::current_time() - start_us;
   const int32_t dim32 = ent->dim_;
   const int32_t reserved = 0;
@@ -429,7 +541,7 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     LOG_WARN("[OBVSAG][cuVS] failed to write snapshot stream", K(ret), KP(key), K(n));
     return true;
   }
-  std::vector<char> chunk(65536);
+  std::vector<char> chunk(4UL * 1024 * 1024);
   uint64_t remaining = graph_bytes;
   while (remaining > 0) {
     const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
@@ -474,26 +586,65 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("[OBVSAG][cuVS] truncated snapshot payload", K(ret), KP(key), K(n64));
     } else {
-      ObCuvsSnapshotFile graph;
-      std::vector<char> chunk(65536);
-      uint64_t remaining = graph_bytes;
-      while (graph.file_ != nullptr && remaining > 0) {
-        const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
-        if (!ob_cuvs_read(in, chunk.data(), bytes) || ::fwrite(chunk.data(), 1, bytes, graph.file_) != bytes) {
-          break;
+      // Check if an existing live entry in g_ob_cuvs_reg already holds the exact same
+      // serialized CAGRA index in process memory (e.g. during DDL build -> snapshot reload).
+      std::shared_ptr<void> shared_bridge;
+      {
+        std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+        for (const auto &kv : g_ob_cuvs_reg) {
+          const ObCuvsEntry *other = kv.second;
+          if (other != nullptr && other->bridge_ != nullptr &&
+              other->dim_ == dim32 && other->built_n_ == n &&
+              other->last_graph_bytes_ == graph_bytes &&
+              other->buf_ids_.size() == n &&
+              other->buf_vecs_.size() == ent->buf_vecs_.size() &&
+              other->buf_ids_.front() == ent->buf_ids_.front() &&
+              other->buf_ids_.back() == ent->buf_ids_.back() &&
+              ::memcmp(other->buf_vecs_.data(), ent->buf_vecs_.data(),
+                       std::min<size_t>(ent->buf_vecs_.size(), 64UL) * sizeof(float)) == 0) {
+            shared_bridge = other->bridge_;
+            break;
+          }
         }
-        remaining -= bytes;
       }
-      ObCuvsSnapshotJob job{graph.path_, nullptr, static_cast<long>(n), dim32, true, -1};
-      if (graph.file_ == nullptr || remaining != 0 || ::fflush(graph.file_) != 0 ||
-          !ob_cuvs_snapshot_big_stack(job)) {
-        delete ent;
-        ret = OB_ERR_VSAG_RETURN_ERROR;
-        LOG_WARN("[OBVSAG][cuVS] failed to load CAGRA graph from snapshot", K(ret), KP(key), K(n64));
-        return ret;
+      std::vector<char> chunk(4UL * 1024 * 1024);
+      uint64_t remaining = graph_bytes;
+      if (shared_bridge != nullptr) {
+        while (remaining > 0) {
+          const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
+          if (!ob_cuvs_read(in, chunk.data(), bytes)) {
+            break;
+          }
+          remaining -= bytes;
+        }
+        if (remaining != 0) {
+          delete ent;
+          ret = OB_ERR_VSAG_RETURN_ERROR;
+          LOG_WARN("[OBVSAG][cuVS] failed to consume CAGRA graph from snapshot", K(ret), KP(key), K(n64));
+          return ret;
+        }
+        ent->bridge_ = shared_bridge;
+      } else {
+        ObCuvsSnapshotFile graph;
+        while (graph.file_ != nullptr && remaining > 0) {
+          const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
+          if (!ob_cuvs_read(in, chunk.data(), bytes) || ::fwrite(chunk.data(), 1, bytes, graph.file_) != bytes) {
+            break;
+          }
+          remaining -= bytes;
+        }
+        ObCuvsSnapshotJob job{graph.path_, nullptr, static_cast<long>(n), dim32, true, -1};
+        if (graph.file_ == nullptr || remaining != 0 || ::fflush(graph.file_) != 0 ||
+            !ob_cuvs_snapshot_big_stack(job)) {
+          delete ent;
+          ret = OB_ERR_VSAG_RETURN_ERROR;
+          LOG_WARN("[OBVSAG][cuVS] failed to load CAGRA graph from snapshot", K(ret), KP(key), K(n64));
+          return ret;
+        }
+        ent->bridge_ = ob_cuvs_wrap(job.handle_);
       }
-      ent->bridge_ = ob_cuvs_wrap(job.handle_);
       ent->built_n_ = n;
+      ent->last_graph_bytes_ = graph_bytes;
       ent->ids_ = ent->buf_ids_;
       {
         std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
@@ -504,6 +655,7 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
       {
         std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
         g_ob_cuvs_marked.insert(key);
+        g_ob_cuvs_last_marked_key.store(key, std::memory_order_relaxed);
       }
       LOG_INFO("[OBVSAG][cuVS] deserialized GPU CAGRA snapshot", KP(key), K(n64), K(dim32),
                K(graph_bytes));
@@ -1592,8 +1744,7 @@ int add_index(VectorIndexPtr &index_handler, float *vector,
   ob_vsag_trace("add_dense", (const void*)index_handler, (long)(dim), (long)(size));
   if (ob_cuvs_marked(index_handler) && index_handler != nullptr &&
       strcmp(static_cast<HnswIndexHandler *>(index_handler)->get_metric(), "l2") == 0) {
-    ob_cuvs_add(index_handler, vector, ids, dim, size);
-    if (!ob_cuvs_vsag_ready(index_handler)) {
+    if (ob_cuvs_add_and_check_skip_vsag(index_handler, vector, ids, dim, size)) {
       return OB_SUCCESS;
     }
   }
@@ -2086,10 +2237,7 @@ long cuvs_knn_search_batch(void *key, const float *queries, long nq, long topk,
   std::vector<float> dst(static_cast<size_t>(nq) * topk);
   ObCuvsBatchJob job{ent, queries, nq, topk, n, need_build,
                      off.data(), dst.data(), 0, false};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_batch_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  (void)ob_cuvs_run_big_stack(ob_cuvs_batch_job, &job);
   if (job.built_) { ob_vsag_trace("cuvs_batch_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
   if (job.served_ != nq) { return 0; }
   for (long q = 0; q < nq; ++q) {
@@ -2107,7 +2255,7 @@ long cuvs_knn_search_batch(void *key, const float *queries, long nq, long topk,
 // [hipVS/cuVS] One-shot RAW batch ANN for dbms_vector.batch_knn: build CAGRA over
 // base (n x dim, row-major f32), batch-search nq queries in ONE GPU call, free.
 // out_ids/out_dist are caller-allocated [nq*topk]; out_ids get cuVS ROW OFFSETS
-// (0..n-1). Runs on a 32MB pthread. Returns nq on success, 0 on failure/disabled.
+// (0..n-1). Runs on the 32MB worker thread. Returns nq on success, 0 on failure/disabled.
 long cuvs_batch_knn(const float *base, long n, long dim,
                     const float *query, long nq, long topk,
                     unsigned int *out_ids, float *out_dist)
@@ -2116,10 +2264,7 @@ long cuvs_batch_knn(const float *base, long n, long dim,
   if (base == nullptr || query == nullptr || out_ids == nullptr ||
       out_dist == nullptr || n <= 0 || dim <= 0 || nq <= 0 || topk <= 0) { return 0; }
   ObCuvsRawBatchJob job{base, n, dim, query, nq, topk, out_ids, out_dist, 0};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_raw_batch_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  (void)ob_cuvs_run_big_stack(ob_cuvs_raw_batch_job, &job);
   ob_vsag_trace("cuvs_raw_batch", base, nq, topk);
   return job.served_;
 }
@@ -2128,8 +2273,10 @@ long cuvs_batch_knn(const float *base, long n, long dim,
 void mark_cuvs_index(void *key) {
 #ifdef OB_BUILD_CUVS
   if (key == nullptr) { return; }
+  if (g_ob_cuvs_last_marked_key.load(std::memory_order_relaxed) == key) { return; }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
   g_ob_cuvs_marked.insert(key);
+  g_ob_cuvs_last_marked_key.store(key, std::memory_order_relaxed);
 #else
   (void)key;
 #endif
@@ -2137,6 +2284,9 @@ void mark_cuvs_index(void *key) {
 void unmark_cuvs_index(void *key) {
 #ifdef OB_BUILD_CUVS
   std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
+  if (g_ob_cuvs_last_marked_key.load(std::memory_order_relaxed) == key) {
+    g_ob_cuvs_last_marked_key.store(nullptr, std::memory_order_relaxed);
+  }
   g_ob_cuvs_marked.erase(key);
 #else
   (void)key;
