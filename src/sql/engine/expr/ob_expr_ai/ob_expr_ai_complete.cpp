@@ -55,8 +55,13 @@ int ObExprAIComplete::calc_result_typeN(ObExprResType &type,
   } else {
     types_stack[MODEL_IDX].set_calc_type(ObVarcharType);
     types_stack[MODEL_IDX].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
-    if (ob_is_string_type(types_stack[PROMPT_IDX].get_type())) {
+    if (types_stack[PROMPT_IDX].get_type() == ObNullType) {
+      types_stack[PROMPT_IDX].set_calc_type(ObVarcharType);
       types_stack[PROMPT_IDX].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+    } else if (ob_is_string_type(types_stack[PROMPT_IDX].get_type())) {
+      if (types_stack[PROMPT_IDX].get_collation_type() != CS_TYPE_BINARY) {
+        types_stack[PROMPT_IDX].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+      }
     } else if (ob_is_json(types_stack[PROMPT_IDX].get_type())) {
     } else {
       ret = OB_ERR_INVALID_TYPE_FOR_OP;

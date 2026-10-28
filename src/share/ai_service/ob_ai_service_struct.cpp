@@ -64,8 +64,15 @@ const char *VALID_PROVIDERS[] = {
           ret = OB_AI_FUNC_PARAM_VALUE_INVALID; \
           LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr()); \
           LOG_WARN("invalid json type", K(ret), K(elem.first), K(elem.second->json_type())); \
+        } else if (elem.second->json_type() == ObJsonNodeType::J_UINT && \
+                   elem.second->get_uint() > static_cast<uint64_t>(INT64_MAX)) { \
+          ret = OB_AI_FUNC_PARAM_VALUE_INVALID; \
+          LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr()); \
+          LOG_WARN("json value out of range", K(ret), K(elem.first), K(elem.second->get_uint())); \
         } else { \
-          int64_t int_value = elem.second->get_int(); \
+          int64_t int_value = (elem.second->json_type() == ObJsonNodeType::J_UINT) \
+              ? static_cast<int64_t>(elem.second->get_uint()) \
+              : elem.second->get_int(); \
           if (int_value < (min_val) || int_value > (max_val)) { \
             ret = OB_AI_FUNC_PARAM_VALUE_INVALID; \
             LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr()); \

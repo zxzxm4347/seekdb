@@ -57,7 +57,12 @@ int ObExprAIPrompt::calc_result_typeN(ObExprResType &type,
   if (ob_is_string_tc(template_type.get_type())) {
     types_stack[0].set_calc_type(ObVarcharType);
     types_stack[0].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
-  } else if (!ob_is_text_tc(template_type.get_type())) {
+  } else if (ob_is_text_tc(template_type.get_type())) {
+    if (types_stack[0].get_collation_type() != CS_TYPE_BINARY
+        && types_stack[0].get_charset_type() != CHARSET_UTF8MB4) {
+      types_stack[0].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+    }
+  } else {
     ret = OB_ERR_INVALID_TYPE_FOR_OP;
     LOG_WARN("ai_prompt, template must be string type", K(ret), K(template_type.get_type()));
   }
@@ -68,6 +73,10 @@ int ObExprAIPrompt::calc_result_typeN(ObExprResType &type,
       types_stack[i].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
     } else if (ob_is_text_tc(types_stack[i].get_type())) {
       // text/blob parameters keep their own type, the payload is decoded in eval.
+      if (types_stack[i].get_collation_type() != CS_TYPE_BINARY
+          && types_stack[i].get_charset_type() != CHARSET_UTF8MB4) {
+        types_stack[i].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+      }
     } else if (ob_is_json(types_stack[i].get_type())) {
       // json parameters keep their structure inside the args array.
     } else {
