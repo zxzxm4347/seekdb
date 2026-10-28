@@ -82,7 +82,7 @@ public:
 
 private:
   static const int64_t DEFAULT_STOPWORD_BUCKET_NUM = 37L;
-  typedef common::hash::ObHashSet<storage::ObFTWord> StopWordSet;
+  typedef common::hash::ObHashSet<storage::ObFTWord, common::hash::NoPthreadDefendMode> StopWordSet;
 
   StopWordSet stopword_set_;
   ObObjMeta stopword_type_;

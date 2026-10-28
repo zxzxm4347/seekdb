@@ -72,17 +72,17 @@ int ObTextRetrievalTokenIter::init(const ObTextRetrievalScanIterParam &iter_para
       OB_ISNULL(inv_scan_domain_id_col_) || OB_ISNULL(allocator_) || OB_ISNULL(mem_context_.ref_context())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("inv_idx_scan_iter or eval_ctx is NULL", K(ret), K_(inv_idx_scan_iter), KPC_(eval_ctx), KPC_(inv_idx_scan_param), KP(allocator_), KP(mem_context_.ref_context()));
+  } else if (OB_ISNULL(skip_ = sql::to_bit_vector(
+                           allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size_))))) {
+    // the skip vector is read by callers with or without relevance  作者：FDE WorkMate
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (FALSE_IT(skip_->init(max_batch_size_))) {
   } else if (!need_calc_relevance()) {
   } else if (OB_ISNULL(relevance_expr_) || OB_ISNULL(inv_idx_agg_expr_) || OB_ISNULL(inv_idx_agg_iter_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_ISNULL(inv_scan_doc_length_col_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(init_calc_exprs_in_relevance_expr())) {
-  } else if (OB_ISNULL(skip_ = sql::to_bit_vector(
-                           allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size_))))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else {
-    skip_->init(max_batch_size_);
   }
   is_inited_ = true;
   return ret;
@@ -203,7 +203,7 @@ int ObTextRetrievalTokenIter::get_next_row()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
+  } else if (!token_doc_cnt_calculated_ && need_calc_relevance() && OB_FAIL(estimate_token_doc_cnt())) {
   } else if (OB_FAIL(query::das_scan_next_row(inv_idx_scan_iter_))) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
     }
@@ -242,7 +242,7 @@ int ObTextRetrievalTokenIter::get_next_batch(const int64_t capacity, int64_t &co
   count = 0;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
+  } else if (!token_doc_cnt_calculated_ && need_calc_relevance() && OB_FAIL(estimate_token_doc_cnt())) {
   } else if (OB_FAIL(query::das_scan_next_rows(
                  inv_idx_scan_iter_, count, OB_MIN(max_batch_size_, capacity)))) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
@@ -413,6 +413,7 @@ ObTextRetrievalDaaTTokenIter::ObTextRetrievalDaaTTokenIter()
     relevance_(),
     doc_id_(),
     cmp_func_(nullptr),
+    is_bytewise_cmp_(false),
     is_inited_(false)
 {
 }
@@ -436,6 +437,7 @@ int ObTextRetrievalDaaTTokenIter::init(const ObTextRetrievalScanIterParam &iter_
       max_batch_size_ = OB_MAX(iter_param.eval_ctx_->max_batch_size_, 1);
       common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(inv_scan_domain_id_col_->datum_meta_.type_, CS_TYPE_BINARY);
       cmp_func_ = basic_funcs->null_first_cmp_;
+      is_bytewise_cmp_ = is_bytewise_comparable_id(inv_scan_domain_id_col_->datum_meta_.type_, CS_TYPE_BINARY);
       if (OB_ISNULL(cmp_func_)) {
         ret = OB_ERR_UNEXPECTED;
       } else if (FALSE_IT(relevance_.set_allocator(allocator_))) {
@@ -551,8 +553,7 @@ int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)
   }
   while (OB_SUCC(ret) && !find) {
     if (cur_idx_ < count_) {
-      if (OB_FAIL(cmp_func_(
-              id_datum, doc_id_[cur_idx_].get_datum(), result, nullptr))) {
+      if (OB_FAIL(cmp_doc_id(id_datum, doc_id_[cur_idx_].get_datum(), result))) {
       } else if (result <= 0) {
         find = true;
       } else {
@@ -566,8 +567,7 @@ int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)
       }
     } else if (cur_idx_ != 0) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(cmp_func_(
-                   id_datum, doc_id_[cur_idx_].get_datum(), result, nullptr))) {
+    } else if (OB_FAIL(cmp_doc_id(id_datum, doc_id_[cur_idx_].get_datum(), result))) {
     } else if (result <= 0) {
       find = true;
     } else {

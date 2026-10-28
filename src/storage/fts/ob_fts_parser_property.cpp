@@ -1013,7 +1013,62 @@ int ObFTParserJsonProps::show_parser_properties(const ObFTParserJsonProps &prope
 
 #undef __FT_PARSER_PROPERTY_SHOW_COMMA
 
+namespace
+{
+// parse_for_parser_helper() is a pure function of (parser, json_str).  Statements such as
+// TOKENIZE() or MATCH() set up a parse helper for every execution with the same few inputs, so
+// the last result of each thread is kept to skip parsing the property json again.
+// 作者：FDE WorkMate
+struct ObFTParserPropertyMemo
+{
+  static const int64_t MAX_JSON_LEN = 512;
+  ObFTParserPropertyMemo() : valid_(false), parser_(), json_len_(0), property_() {}
+  bool get(const ObFTParser &parser, const ObString &json_str, ObFTParserProperty &property) const
+  {
+    const bool hit = valid_ && parser_ == parser && json_len_ == json_str.length()
+                     && (0 == json_len_ || 0 == MEMCMP(json_, json_str.ptr(), json_len_));
+    if (hit) {
+      property = property_;
+    }
+    return hit;
+  }
+  void put(const ObFTParser &parser, const ObString &json_str, const ObFTParserProperty &property)
+  {
+    if (json_str.length() <= MAX_JSON_LEN) {
+      parser_ = parser;
+      json_len_ = json_str.length();
+      if (json_len_ > 0) {
+        MEMCPY(json_, json_str.ptr(), json_len_);
+      }
+      property_ = property;
+      valid_ = true;
+    }
+  }
+  bool valid_;
+  ObFTParser parser_;
+  int64_t json_len_;
+  char json_[MAX_JSON_LEN];
+  // only holds scalars and strings pointing to static literals, so a plain copy is safe
+  ObFTParserProperty property_;
+};
+thread_local ObFTParserPropertyMemo parser_property_memo;
+} // namespace
+
 int ObFTParserProperty::parse_for_parser_helper(const ObFTParser &parser, const ObString &json_str)
+{
+  int ret = OB_SUCCESS;
+  // parse into a fresh object so that the memoized value never depends on the previous state
+  ObFTParserProperty property;
+  if (parser_property_memo.get(parser, json_str, *this)) {
+  } else if (OB_FAIL(property.do_parse_for_parser_helper(parser, json_str))) {
+  } else {
+    *this = property;
+    parser_property_memo.put(parser, json_str, property);
+  }
+  return ret;
+}
+
+int ObFTParserProperty::do_parse_for_parser_helper(const ObFTParser &parser, const ObString &json_str)
 {
   int ret = OB_SUCCESS;
   ObFTParserJsonProps props;

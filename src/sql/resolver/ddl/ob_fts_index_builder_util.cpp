@@ -22,6 +22,7 @@
 #include "data_plane/fts/dict/ob_gen_dic_loader.h"
 #include "data_plane/fts/dict/ob_dic_lock_service.h"
 #include "share/ob_server_struct.h"
+#include "lib/utility/utility.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_schema_utils.h"
@@ -1045,9 +1046,16 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
         decided_parallelism = MAX(original_parallelism, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
+        decided_parallelism = MAX(original_parallelism / 3, 1L);
+        break;
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        decided_parallelism = MAX(original_parallelism / 3, 1L);
+        // Building the inverted tables tokenizes, sorts and writes every word of every document,
+        // which is CPU bound.  Without an explicit degree (the default 1) a single PX worker
+        // does all of it, so pick a small cpu-bounded degree instead.  作者：FDE WorkMate
+        decided_parallelism = original_parallelism > 1
+            ? MAX(original_parallelism / 3, 1L)
+            : MIN(FTS_AUTO_MAX_PARALLELISM, MAX(1L, static_cast<int64_t>(common::get_cpu_num()) / 2));
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:

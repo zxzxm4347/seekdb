@@ -19,6 +19,7 @@
 
 #include "ob_i_sparse_retrieval_iter.h"
 #include "ob_sparse_utils.h"
+#include "ob_sparse_retrieval_util.h"
 #include "storage/access/ob_scan_merge_loser_tree.h"
 #include "storage/access/ob_simple_rows_merger.h"
 
@@ -54,6 +55,9 @@ private:
   }
 private:
   common::ObDatumCmpFuncType cmp_func_;
+  // doc ids are usually varbinary: compare bytes inline instead of going through the generic
+  // collation dispatch for every heap step.  作者：FDE WorkMate
+  bool is_binary_str_;
   // TODO: if memory lifetime of docid datum is guaranteed by dim_iters, we can use pointer to datum directly
   //       and avoid deep copy into merge heap here
   const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids_;

@@ -207,6 +207,9 @@ private:
   int generate_text_ir_pushdown_expr_ctdef(const ObTextRetrievalInfo &tr_info,
                                            const ObLogTableScan &op,
                                            ObDASScanCtDef &scan_ctdef);
+  int check_relevance_only_for_match_filter(const ObLogTableScan &op,
+                                            const ObTextRetrievalInfo &tr_info,
+                                            bool &only_for_filter) const;
   int generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_info,
                                   ObDASIRScanCtDef &text_ir_scan_ctdef);
   int check_skip_index_validity(const ObTextRetrievalInfo &tr_info, bool &is_valid) const;

@@ -108,6 +108,11 @@ private:
   int init_topk_limit();
   int init_block_max_iter_param();
   int init_doc_length_est_param();
+  bool skip_relevance() const
+  {
+    return daat_mode_ && !topk_mode_ && !function_lookup_mode_ && OB_NOT_NULL(ir_ctdef_)
+        && ir_ctdef_->can_skip_relevance();
+  }
 private:
   static const int64_t INV_IDX_ROWKEY_COL_CNT = 2;
 private:

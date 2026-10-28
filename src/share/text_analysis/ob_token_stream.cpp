@@ -96,9 +96,13 @@ int ObTextWhitespaceTokenizer::get_next(ObDatum &next_token, int64_t &token_freq
     const char *doc = input_doc_->ptr_;
     const uint32_t doc_len = get_input_buf_len();
     int64_t token_len = 0;
+    const bool is_ascii_compat = (1 == cs_->mbminlen);
     // to next non-whitespace pos
     while (OB_SUCC(ret) && found_delimiter()) {
-      const int64_t c_len = ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
+      const char *p = doc + trav_pos_;
+      const int64_t c_len = (is_ascii_compat && static_cast<unsigned char>(*p) < 0x80)
+          ? 1
+          : ob_mbcharlen_ptr(cs_, p, doc + doc_len);
       trav_pos_ += c_len;
       if (trav_pos_ >= doc_len || 0 == c_len) {// if char is invalid, just skip the rest of document
         iter_end_ = true;
@@ -112,7 +116,10 @@ int ObTextWhitespaceTokenizer::get_next(ObDatum &next_token, int64_t &token_freq
 
     // to next whitespace pos
     while (OB_SUCC(ret) && !found_delimiter()) {
-      const int64_t c_len = ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
+      const char *p = doc + trav_pos_;
+      const int64_t c_len = (is_ascii_compat && static_cast<unsigned char>(*p) < 0x80)
+          ? 1
+          : ob_mbcharlen_ptr(cs_, p, doc + doc_len);
       trav_pos_ += c_len;
       token_len += c_len;
       if (trav_pos_ >= doc_len || 0 == c_len) {
@@ -136,10 +143,8 @@ int ObTextWhitespaceTokenizer::get_next(ObDatum &next_token, int64_t &token_freq
 
 bool ObTextWhitespaceTokenizer::found_delimiter()
 {
-  bool found = false;
-  const char *curr_char = input_doc_->ptr_ + trav_pos_;
-  found = ob_isspace(cs_, *curr_char) || ob_iscntrl(cs_, *curr_char) || ob_ispunct(cs_, *curr_char);
-  return found;
+  const unsigned char c = static_cast<unsigned char>(input_doc_->ptr_[trav_pos_]);
+  return 0 != (cs_->ctype[c + 1] & (_MY_SPC | _MY_CTR | _MY_PNT));
 }
 
 ObTokenNormalizer::ObTokenNormalizer()
@@ -293,6 +298,26 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
     } else if (OB_UNLIKELY(!found_alnum)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
+      if (1 == cs_->mbminlen && norm_token_len <= INLINE_ASCII_BUF_SIZE) {
+        bool all_ascii = true;
+        bool has_upper = false;
+        for (uint32_t i = 0; i < norm_token_len; ++i) {
+          const unsigned char c = static_cast<unsigned char>(norm_token_ptr[i]);
+          if (OB_UNLIKELY(c >= 0x80)) {
+            all_ascii = false;
+            break;
+          } else if (c >= 'A' && c <= 'Z') {
+            has_upper = true;
+            ascii_buf_[i] = static_cast<char>(c + ('a' - 'A'));
+          } else {
+            ascii_buf_[i] = static_cast<char>(c);
+          }
+        }
+        if (OB_LIKELY(all_ascii)) {
+          next_token.set_string(has_upper ? ascii_buf_ : norm_token_ptr, norm_token_len);
+          return OB_SUCCESS;
+        }
+      }
       ObString norm_alnum_token(norm_token_len, norm_token_ptr);
       ObString norm_lower_token;
       if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {

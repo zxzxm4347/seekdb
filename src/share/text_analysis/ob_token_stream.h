@@ -131,7 +131,9 @@ public:
   virtual void reuse() override;
   virtual int get_next(ObDatum &next_token, int64_t &token_freq) override;
 private:
+  static const uint32_t INLINE_ASCII_BUF_SIZE = 256;
   ObArenaAllocator norm_allocator_;
+  char ascii_buf_[INLINE_ASCII_BUF_SIZE];
 };
 
 // group (deduplicate) and count

@@ -137,6 +137,9 @@ public:
   ObFTParserProperty();
   ~ObFTParserProperty() = default;
   int parse_for_parser_helper(const ObFTParser &parser, const ObString &json_str);
+private:
+  int do_parse_for_parser_helper(const ObFTParser &parser, const ObString &json_str);
+public:
 
   bool is_equal(const ObFTParserProperty &other) const
   {

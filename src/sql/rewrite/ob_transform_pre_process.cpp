@@ -178,7 +178,12 @@ int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt> 
       }
     }
     if (OB_SUCC(ret)) {
+      bool order_observable = true;
+      bool pruned = false;
       if (stmt->get_match_exprs().count() > 0 &&
+          OB_FAIL(simplify_unobserved_fulltext_view(parent_stmts, *stmt, order_observable, pruned))) {
+      } else if (FALSE_IT(trans_happened |= pruned)) {
+      } else if (stmt->get_match_exprs().count() > 0 && order_observable &&
           OB_FAIL(preserve_order_for_fulltext_search(stmt, is_happened))) {
       } else {
         trans_happened |= is_happened;
@@ -3784,6 +3789,87 @@ int ObTransformPreProcess::do_flatten_conditions(ObDMLStmt *stmt, ObIArray<ObRaw
   } else if (trans_happened) {
     trans_happened =  flatten_happend ;
     OPT_TRACE("   flatten_happend:", flatten_happend);
+  }
+  return ret;
+}
+
+// Fulltext statements skip the cost free rewrite rules, so a fulltext view keeps its implicit
+// relevance order and all of its select items even when its parent never reads them, e.g.
+//   select count(*) from (select id from t where match(c) against('x') limit 20) v
+// Only the number of rows reaches the parent, and that number depends neither on the order nor on
+// the projected columns.  Ranking every matched document for a top-k, and looking up the main
+// table for `id`, is wasted work then.  For such a view:
+//  - is_order_observable is false, so the relevance order is not added;
+//  - unused select items are pruned the same way as ObTransformProjectPruning does, as long as they
+//    hold no MATCH expression (the fulltext scan is bound to those).
+// WITH TIES, SQL_CALC_FOUND_ROWS and assignments make the outcome order dependent and are kept.
+// 作者：FDE WorkMate
+int ObTransformPreProcess::simplify_unobserved_fulltext_view(ObIArray<ObParentDMLStmt> &parent_stmts,
+                                                             ObDMLStmt &stmt,
+                                                             bool &is_order_observable,
+                                                             bool &trans_happened)
+{
+  int ret = OB_SUCCESS;
+  is_order_observable = true;
+  trans_happened = false;
+  ObDMLStmt *parent = parent_stmts.empty() ? NULL : parent_stmts.at(parent_stmts.count() - 1).stmt_;
+  TableItem *view = NULL;
+  if (NULL == parent || !stmt.is_select_stmt()) {
+    // the root stmt returns its rows to the client
+  } else if (stmt.is_fetch_with_ties() || stmt.is_calc_found_rows() ||
+             stmt.is_contains_assignment()) {
+    // keep the order
+  } else {
+    ObIArray<TableItem *> &table_items = parent->get_table_items();
+    for (int64_t i = 0; OB_SUCC(ret) && NULL == view && i < table_items.count(); ++i) {
+      TableItem *table_item = table_items.at(i);
+      if (OB_ISNULL(table_item)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("table item is null", K(ret));
+      } else if (table_item->is_generated_table()
+                 && static_cast<ObDMLStmt *>(table_item->ref_query_) == &stmt) {
+        view = table_item;
+      }
+    }
+  }
+  if (OB_SUCC(ret) && NULL != view) {
+    ObSelectStmt &view_stmt = static_cast<ObSelectStmt &>(stmt);
+    ObSEArray<ColumnItem, 4> column_items;
+    bool is_valid = false;
+    ObSqlBitSet<> removed_idx;
+    if (OB_FAIL(parent->get_column_items(view->table_id_, column_items))) {
+      LOG_WARN("failed to get column items", K(ret));
+    } else if (!column_items.empty()) {
+      // the parent reads the rows themselves
+    } else if (FALSE_IT(is_order_observable = false)) {
+    } else if (OB_FAIL(ObTransformUtils::check_project_pruning_validity(view_stmt, is_valid))) {
+      LOG_WARN("failed to check project pruning validity", K(ret));
+    } else if (!is_valid) {
+      // keep the select items
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < view_stmt.get_select_item_size(); ++i) {
+        ObRawExpr *expr = view_stmt.get_select_item(i).expr_;
+        bool need_remove = false;
+        if (OB_ISNULL(expr)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("select expr is null", K(ret));
+        } else if (expr->has_flag(CNT_MATCH_EXPR)) {
+          // keep it
+        } else if (OB_FAIL(ObTransformUtils::check_select_item_need_remove(&view_stmt, i,
+                                                                             need_remove))) {
+          LOG_WARN("failed to check select item", K(ret));
+        } else if (need_remove && OB_FAIL(removed_idx.add_member(i))) {
+        }
+      }
+      if (OB_SUCC(ret) && !removed_idx.is_empty()) {
+        if (OB_FAIL(ObTransformUtils::remove_select_items(ctx_, view->table_id_, view_stmt,
+                                                          *parent, removed_idx))) {
+          LOG_WARN("failed to remove select items", K(ret));
+        } else {
+          trans_happened = true;
+        }
+      }
+    }
   }
   return ret;
 }

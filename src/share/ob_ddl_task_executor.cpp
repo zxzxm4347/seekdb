@@ -16,6 +16,7 @@
 
 #include "ob_ddl_task_executor.h"
 #include "lib/ob_running_mode.h"
+#include "lib/utility/utility.h"
 #include "lib/thread/ob_thread_name.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "share/rc/ob_server_runtime.h"
@@ -350,7 +351,14 @@ int ObDDLLocalBuilder::push_task(ObAsyncTask &task)
 
 int64_t ObDDLLocalBuilder::get_thread_cnt_() const
 {
-  return lib::is_mini_mode() ? 1 : 16;
+  // A single builder thread serializes every complement job, e.g. the word-doc and doc-word aux
+  // tables of one fulltext index wait for each other.  Mini mode keeps a small pool that still
+  // lets independent jobs overlap, bounded by the cpus actually available.  作者：FDE WorkMate
+  static const int64_t MINI_MODE_MIN_THREAD_CNT = 2;
+  static const int64_t MINI_MODE_MAX_THREAD_CNT = 4;
+  return lib::is_mini_mode()
+      ? MIN(MINI_MODE_MAX_THREAD_CNT, MAX(MINI_MODE_MIN_THREAD_CNT, common::get_cpu_num() / 2))
+      : 16;
 }
 
 }  // end namespace share

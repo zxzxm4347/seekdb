@@ -125,6 +125,19 @@ int ObGenDicLoader::get_dic_loader(const ObString &parser_name,
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(dic_loader_key.init(parser_name, charset))) {
   } else {
+    // Fast path: loaders are created once and then only looked up, so a shared lock is enough
+    // for the common case.  作者：FDE WorkMate
+    TCRLockGuard guard(lock_);
+    if (OB_FAIL(dic_loader_map_.get_refactored(dic_loader_key, dic_loader))) {
+      if (OB_HASH_NOT_EXIST == ret) {
+        dic_loader = nullptr;
+        ret = OB_SUCCESS;
+      }
+    } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+    }
+  }
+  if (OB_FAIL(ret) || nullptr != dic_loader) {
+  } else {
     TCWLockGuard guard(lock_);
     if (OB_FAIL(dic_loader_map_.get_refactored(dic_loader_key, dic_loader))) {
       if (OB_HASH_NOT_EXIST == ret) {

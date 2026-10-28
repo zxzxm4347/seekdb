@@ -156,7 +156,18 @@ private:
   ObFixedArray<double, ObIAllocator> relevance_; // when ~ObFixedArray(), wikll destory itself
   ObFixedArray<ObDocIdExt, ObIAllocator> doc_id_;
   common::ObDatumCmpFuncType cmp_func_;
+  bool is_bytewise_cmp_;
   bool is_inited_;
+  OB_INLINE int cmp_doc_id(const ObDatum &l, const ObDatum &r, int &result) const
+  {
+    int ret = OB_SUCCESS;
+    if (is_bytewise_cmp_) {
+      result = bytewise_null_first_cmp(l, r);
+    } else {
+      ret = cmp_func_(l, r, result, nullptr);
+    }
+    return ret;
+  }
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalDaaTTokenIter);
 };
 

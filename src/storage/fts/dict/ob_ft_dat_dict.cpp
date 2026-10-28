@@ -258,9 +258,7 @@ int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
   int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
   int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
 
-  ObFTSingleWord word;
-  word.set_word(ft_char.ptr(), ft_char.length());
-  if (OB_FAIL(dat_->get_map()->find(word, code)) && OB_ENTRY_NOT_EXIST != ret) {
+  if (OB_FAIL(map->find(ft_char, code)) && OB_ENTRY_NOT_EXIST != ret) {
   } else if (OB_ENTRY_NOT_EXIST == ret) {
     ret = OB_SUCCESS;
     hit.set_unmatch();
@@ -301,16 +299,25 @@ ObArrayHashMap *ObFTDAT::get_map() { return reinterpret_cast<ObArrayHashMap *>(b
 
 int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
 {
+  return find(word.get_word(), code);
+}
+
+// Probes with the key bytes directly, so a lookup needs no ObFTSingleWord copy of the key.
+// 作者：FDE WorkMate
+int ObArrayHashMap::find(const ObString &key, ObFTWordCode &code) const
+{
   int ret = OB_ENTRY_NOT_EXIST;
-  uint64_t hash = word.get_word().hash();
-  uint64_t index = hash % header_.capacity_;
+  const uint64_t capacity = header_.capacity_;
+  const int64_t key_len = key.length();
+  uint64_t index = key.hash() % capacity;
   while (header_.data[index].used) {
-    if (header_.data[index].word == word) {
+    const Entry &entry = header_.data[index];
+    if (entry.word.word_len == key_len && 0 == MEMCMP(entry.word.word, key.ptr(), key_len)) {
       code = header_.data[index].code;
       ret = OB_SUCCESS;
       break;
     } else {
-      index = (index + 3) % header_.capacity_;
+      index = (index + 3) % capacity;
     }
   }
   return ret;

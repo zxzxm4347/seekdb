@@ -378,21 +378,42 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+// Byte order compare, identical to strcmp under CS_TYPE_UTF8MB4_BIN (ob_strnncoll_mb_bin).
+static OB_INLINE int range_word_cmp(const ObString &l, const ObString &r)
+{
+  const int64_t len = MIN(l.length(), r.length());
+  const int cmp = 0 == len ? 0 : memcmp(l.ptr(), r.ptr(), len);
+  return 0 != cmp ? cmp : static_cast<int>(l.length() - r.length());
+}
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
+  if (is_sorted_disjoint_) {
+    // Ranges are sorted by start and do not overlap: the candidate is the last range whose
+    // start <= word.  作者：FDE WorkMate
+    int64_t lo = 0;
+    int64_t hi = range_dicts_.size();
+    while (lo < hi) {
+      const int64_t mid = lo + (hi - lo) / 2;
+      if (range_word_cmp(range_dicts_[mid].start_.get_word(), single_word) <= 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    if (lo > 0 && range_word_cmp(range_dicts_[lo - 1].end_.get_word(), single_word) >= 0) {
+      dict = range_dicts_[lo - 1].dict_;
       found = true;
+    }
+  } else {
+    for (int i = 0; !found && i < range_dicts_.size(); ++i) {
+      if (range_word_cmp(range_dicts_[i].start_.get_word(), single_word) <= 0
+          && range_word_cmp(range_dicts_[i].end_.get_word(), single_word) >= 0) {
+        dict = range_dicts_[i].dict_;
+        found = true;
+      }
     }
   }
   if (!found) {
@@ -400,6 +421,34 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
     ret = OB_ENTRY_NOT_EXIST;
   }
   return ret;
+}
+
+void ObFTRangeDict::sort_ranges()
+{
+  // Insertion sort: there are only a handful of ranges.  Ranges keep their original order when
+  // they overlap, so the linear scan still returns the first matching one.
+  const int64_t cnt = range_dicts_.size();
+  bool disjoint = true;
+  for (int64_t i = 1; disjoint && i < cnt; ++i) {
+    for (int64_t j = 0; disjoint && j < i; ++j) {
+      if (range_word_cmp(range_dicts_[i].start_.get_word(), range_dicts_[j].end_.get_word()) <= 0
+          && range_word_cmp(range_dicts_[j].start_.get_word(), range_dicts_[i].end_.get_word()) <= 0) {
+        disjoint = false;
+      }
+    }
+  }
+  if (disjoint) {
+    for (int64_t i = 1; i < cnt; ++i) {
+      ObFTRange cur = range_dicts_[i];
+      int64_t j = i - 1;
+      while (j >= 0 && range_word_cmp(range_dicts_[j].start_.get_word(), cur.start_.get_word()) > 0) {
+        range_dicts_[j + 1] = range_dicts_[j];
+        --j;
+      }
+      range_dicts_[j + 1] = cur;
+    }
+  }
+  is_sorted_disjoint_ = disjoint;
 }
 
 int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_container)
@@ -421,6 +470,9 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       if (OB_FAIL(range_dicts_.push_back(range))) {
       }
     }
+  }
+  if (OB_SUCC(ret)) {
+    sort_ranges();
   }
   return ret;
 }

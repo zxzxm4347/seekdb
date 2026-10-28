@@ -39,7 +39,7 @@ public:
   void reset();
 
   int hash(uint64_t &hash_val) const;
-  const common::ObDatum &get_datum() const;
+  OB_INLINE const common::ObDatum &get_datum() const { return datum_; }
   int from_datum(const common::ObDatum &datum);
   int from_obj(const common::ObObj &obj);
 

@@ -689,7 +689,19 @@ public:
   static bool is_graph(const ObCollationType collation_type, char c);
   static bool usemb(const ObCollationType collation_type);
   static int is_mbchar(const ObCollationType collation_type, const char *str, const char *end);
-  static const ObCharsetInfo *get_charset(const ObCollationType coll_type);
+  // Hot on every collation-aware compare: once a collation is initialized the lookup is a plain
+  // array load, the slow path keeps the lazy init and the error logging.  作者：FDE WorkMate
+  static OB_INLINE const ObCharsetInfo *get_charset(const ObCollationType coll_type)
+  {
+    const ObCharsetInfo *cs = NULL;
+    if (OB_LIKELY(coll_type > CS_TYPE_INVALID && coll_type < CS_TYPE_MAX)
+        && OB_LIKELY(NULL != (cs = charset_arr_inited[coll_type]))) {
+    } else {
+      cs = get_charset_slow(coll_type);
+    }
+    return cs;
+  }
+  static const ObCharsetInfo *get_charset_slow(const ObCollationType coll_type);
   static int get_mbmaxlen_by_coll(const ObCollationType collation_type, int64_t &mbmaxlen);
   static int get_mbminlen_by_coll(const ObCollationType collation_type, int64_t &mbminlen);
 

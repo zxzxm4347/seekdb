@@ -69,8 +69,7 @@ public:
 
 #define FT_PARSER_TYPE(fts_type, parser_name)                          \
   OB_INLINE bool is_##parser_name() const {                            \
-    ParserType type = fts_type;                                        \
-    return ObFTParserName(NAME_STR[type]) == parser_name_;             \
+    return 0 == common::ObString(parser_name_.len(), parser_name_.str()).case_compare(#parser_name); \
   }
   FTS_BUILD_IN_PARSER_LIST
 #undef FT_PARSER_TYPE

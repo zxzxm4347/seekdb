@@ -153,32 +153,18 @@ ob_wc_t ObUnicodeBlockUtils::get_unicode_from_u8(const char *input, const uint8_
 #define OB_IK_GET_NUMBER_UNICODE(str) get_unicode_from_u8(str, sizeof(str))
 bool ObUnicodeBlockUtils::is_unicode_cn_number(ob_wc_t unicode)
 {
-  // Chinese numerical characters: "一二两三四五六七八九十零壹贰叁肆伍陆柒捌玖拾百千万亿拾佰仟萬億兆卅廿"
-  static const ob_wc_t cn_number_array[] = {
-      OB_IK_GET_NUMBER_UNICODE("一"), OB_IK_GET_NUMBER_UNICODE("二"),
-      OB_IK_GET_NUMBER_UNICODE("两"), OB_IK_GET_NUMBER_UNICODE("三"),
-      OB_IK_GET_NUMBER_UNICODE("四"), OB_IK_GET_NUMBER_UNICODE("五"),
-      OB_IK_GET_NUMBER_UNICODE("六"), OB_IK_GET_NUMBER_UNICODE("七"),
-      OB_IK_GET_NUMBER_UNICODE("八"), OB_IK_GET_NUMBER_UNICODE("九"),
-      OB_IK_GET_NUMBER_UNICODE("十"), OB_IK_GET_NUMBER_UNICODE("零"),
-      OB_IK_GET_NUMBER_UNICODE("壹"), OB_IK_GET_NUMBER_UNICODE("贰"),
-      OB_IK_GET_NUMBER_UNICODE("叁"), OB_IK_GET_NUMBER_UNICODE("肆"),
-      OB_IK_GET_NUMBER_UNICODE("伍"), OB_IK_GET_NUMBER_UNICODE("陆"),
-      OB_IK_GET_NUMBER_UNICODE("柒"), OB_IK_GET_NUMBER_UNICODE("捌"),
-      OB_IK_GET_NUMBER_UNICODE("玖"), OB_IK_GET_NUMBER_UNICODE("拾"),
-      OB_IK_GET_NUMBER_UNICODE("百"), OB_IK_GET_NUMBER_UNICODE("千"),
-      OB_IK_GET_NUMBER_UNICODE("万"), OB_IK_GET_NUMBER_UNICODE("亿"),
-      OB_IK_GET_NUMBER_UNICODE("拾"), OB_IK_GET_NUMBER_UNICODE("佰"),
-      OB_IK_GET_NUMBER_UNICODE("仟"), OB_IK_GET_NUMBER_UNICODE("萬"),
-      OB_IK_GET_NUMBER_UNICODE("億"), OB_IK_GET_NUMBER_UNICODE("兆"),
-      OB_IK_GET_NUMBER_UNICODE("卅"), OB_IK_GET_NUMBER_UNICODE("廿"),
-  };
-  for (int i = 0; i < sizeof(cn_number_array) / sizeof(cn_number_array[0]); i++) {
-    if (unicode == cn_number_array[i]) {
+  switch (unicode) {
+    case U'一': case U'二': case U'两': case U'三': case U'四':
+    case U'五': case U'六': case U'七': case U'八': case U'九':
+    case U'十': case U'零': case U'壹': case U'贰': case U'叁':
+    case U'肆': case U'伍': case U'陆': case U'柒': case U'捌':
+    case U'玖': case U'拾': case U'百': case U'千': case U'万':
+    case U'亿': case U'佰': case U'仟': case U'萬': case U'億':
+    case U'兆': case U'卅': case U'廿':
       return true;
-    }
+    default:
+      return false;
   }
-  return false;
 }
 
 } //  namespace storage

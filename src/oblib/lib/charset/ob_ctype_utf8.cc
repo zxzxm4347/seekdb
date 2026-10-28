@@ -381,6 +381,33 @@ static int ob_strnncollsp_utf8mb4(const ObCharsetInfo *cs,
   ob_wc_t src_wc = 0, dst_wc = 0;
   const unsigned char *se= src + srclen, *te= dst + dstlen;
   ObUnicaseInfo *uni_plane= cs->caseinfo;
+  {
+    // Identical, well-formed leading characters have identical sort weights, so they can be
+    // skipped without decoding both sides and mapping case.  Sorting keys such as fulltext
+    // words share long prefixes, often the whole string.  Stops at the first byte difference
+    // or at an ill-formed sequence, where the generic loop below takes over unchanged.
+    // 作者：FDE WorkMate
+    const size_t min_len = srclen < dstlen ? srclen : dstlen;
+    size_t same = 0;
+    while (same < min_len && src[same] == dst[same]) {
+      ++same;
+    }
+    const unsigned char *p = src;
+    const unsigned char *pe = src + same;
+    while (p < pe) {
+      if (*p < 0x80) {
+        ++p;
+      } else {
+        int len = ob_mb_wc_utf8mb4(cs, &src_wc, p, se);
+        if (len <= 0 || p + len > pe) {
+          break;
+        }
+        p += len;
+      }
+    }
+    dst += (p - src);
+    src = p;
+  }
   while ( src < se && dst < te ) {
     int s_res= ob_mb_wc_utf8mb4(cs, &src_wc, src, se);
     int t_res= ob_mb_wc_utf8mb4(cs, &dst_wc, dst, te);

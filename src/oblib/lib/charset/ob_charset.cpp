@@ -1729,13 +1729,20 @@ int ObCharset::first_valid_char(
   } else if (buf_size <= 0) {
     char_len = 0;
   } else {
-    int error = 0;
-    int64_t len = 0;
+    const unsigned char c0 = static_cast<unsigned char>(buf[0]);
     const ObCharsetInfo *cs = get_charset(collation_type);
     if (OB_ISNULL(cs->cset)) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (1 == cs->mbminlen && c0 < 0x80) {
+      char_len = 1;
+    } else if (4 == cs->mbmaxlen && buf_size >= 3 && c0 >= 0xE1 && c0 <= 0xEC
+               && c0 != 0xED
+               && (static_cast<unsigned char>(buf[1]) & 0xC0) == 0x80
+               && (static_cast<unsigned char>(buf[2]) & 0xC0) == 0x80) {
+      char_len = 3;
     } else {
-      len = static_cast<int64_t>(cs->cset->well_formed_len(cs, buf, buf + buf_size, 1, &error));
+      int error = 0;
+      int64_t len = static_cast<int64_t>(cs->cset->well_formed_len(cs, buf, buf + buf_size, 1, &error));
       if (OB_LIKELY(0 == error)) {
         char_len = len;
       } else {
@@ -2046,7 +2053,7 @@ int ObCharset::is_mbchar(const ObCollationType collation_type, const char *str, 
   return ret;
 }
 
-const ObCharsetInfo *ObCharset::get_charset(const ObCollationType collation_type)
+const ObCharsetInfo *ObCharset::get_charset_slow(const ObCollationType collation_type)
 {
   ObCharsetInfo *ret = NULL;
   if (OB_UNLIKELY(collation_type <= CS_TYPE_INVALID ||
@@ -2174,7 +2181,8 @@ inline bool ObCharset::is_argument_valid(const ObCollationType &collation_type, 
 {
   bool is_arg_valid = true;
   if (OB_LIKELY(collation_type > CS_TYPE_INVALID && collation_type < CS_TYPE_MAX
-              && OB_NOT_NULL(get_charset_uninit(collation_type)))) {
+              && (OB_NOT_NULL(charset_arr_inited[collation_type])
+                  || OB_NOT_NULL(get_charset_uninit(collation_type))))) {
     if (OB_UNLIKELY(str_len1 < 0) ||
       OB_UNLIKELY(str_len2 < 0) ||
       (OB_ISNULL(str1) && OB_UNLIKELY(0 != str_len1)) ||

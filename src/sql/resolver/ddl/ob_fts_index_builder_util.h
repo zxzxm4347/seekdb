@@ -159,6 +159,8 @@ public:
         const share::schema::ObIndexType index_type,
         const int64_t original_parallelism,
         int64_t &decided_parallelism);
+  // Upper bound of the degree chosen for inverted-table builds without an explicit degree.
+  static const int64_t FTS_AUTO_MAX_PARALLELISM = 4;
 private:
   static int build_fts_aux_index_name(
     const ObIndexType type,

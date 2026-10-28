@@ -36,10 +36,121 @@
 #include "storage/fts/ik/ob_ik_quantifier_processor.h"
 #include "storage/fts/ik/ob_ik_surrogate_processor.h"
 
+#include "lib/allocator/page_arena.h"
+#include "lib/lock/ob_mutex.h"
+
 namespace oceanbase
 {
 namespace storage
 {
+namespace
+{
+struct IKSharedDictEntry
+{
+  ObFTDictHub *hub_ = nullptr;
+  ObArenaAllocator alloc_;
+  ObFTCacheRangeContainer cache_main_;
+  ObFTCacheRangeContainer cache_quan_;
+  ObIFTDict *dict_main_ = nullptr;
+  ObIFTDict *dict_quan_ = nullptr;
+
+  IKSharedDictEntry()
+      : alloc_(ObMemAttr("IKDictCache")),
+        cache_main_(alloc_),
+        cache_quan_(alloc_)
+  {}
+};
+
+class IKSharedDictCache
+{
+public:
+  static IKSharedDictCache &instance()
+  {
+    static IKSharedDictCache inst;
+    return inst;
+  }
+
+  int get(ObFTDictHub *hub,
+          ObIFTDict *&dict_main,
+          ObIFTDict *&dict_quan)
+  {
+    int ret = OB_SUCCESS;
+    IKSharedDictEntry *fast = __atomic_load_n(&entry_, __ATOMIC_ACQUIRE);
+    if (OB_LIKELY(nullptr != fast && fast->hub_ == hub)) {
+      dict_main = fast->dict_main_;
+      dict_quan = fast->dict_quan_;
+    } else {
+      lib::ObMutexGuard guard(mutex_);
+      IKSharedDictEntry *cur = __atomic_load_n(&entry_, __ATOMIC_RELAXED);
+      if (nullptr != cur && cur->hub_ == hub) {
+        dict_main = cur->dict_main_;
+        dict_quan = cur->dict_quan_;
+      } else {
+        IKSharedDictEntry *next = OB_NEW(IKSharedDictEntry, ObMemAttr("IKDictCache"));
+        if (OB_ISNULL(next)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else if (OB_FAIL(build_entry(hub, *next))) {
+          OB_DELETE(IKSharedDictEntry, ObMemAttr("IKDictCache"), next);
+        } else {
+          __atomic_store_n(&entry_, next, __ATOMIC_RELEASE);
+          dict_main = next->dict_main_;
+          dict_quan = next->dict_quan_;
+        }
+      }
+    }
+    return ret;
+  }
+
+private:
+  static int load_one(ObFTDictHub *hub, const ObFTDictDesc &desc, ObFTCacheRangeContainer &container)
+  {
+    int ret = hub->load_cache(desc, container);
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = hub->build_cache(desc, container);
+    }
+    return ret;
+  }
+
+  static int build_one(const ObFTDictDesc &desc,
+                       ObIAllocator &alloc,
+                       ObFTCacheRangeContainer &container,
+                       ObIFTDict *&dict)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_ISNULL(dict = OB_NEWx(ObFTRangeDict, &alloc, alloc, &container, desc))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(dict->init())) {
+      OB_DELETEx(ObIFTDict, &alloc, dict);
+    }
+    return ret;
+  }
+
+  static int build_entry(ObFTDictHub *hub, IKSharedDictEntry &entry)
+  {
+    int ret = OB_SUCCESS;
+    ObFTDictDesc main_desc("main_dict",
+                           ObFTDictType::DICT_IK_MAIN,
+                           ObCharsetType::CHARSET_UTF8MB4,
+                           ObCollationType::CS_TYPE_UTF8MB4_BIN);
+    ObFTDictDesc quan_desc("quan_dict",
+                           ObFTDictType::DICT_IK_QUAN,
+                           ObCharsetType::CHARSET_UTF8MB4,
+                           ObCollationType::CS_TYPE_UTF8MB4_BIN);
+    if (OB_FAIL(load_one(hub, main_desc, entry.cache_main_))) {
+    } else if (OB_FAIL(load_one(hub, quan_desc, entry.cache_quan_))) {
+    } else if (OB_FAIL(build_one(main_desc, entry.alloc_, entry.cache_main_, entry.dict_main_))) {
+    } else if (OB_FAIL(build_one(quan_desc, entry.alloc_, entry.cache_quan_, entry.dict_quan_))) {
+    } else {
+      entry.hub_ = hub;
+    }
+    return ret;
+  }
+
+  lib::ObMutex mutex_;
+  IKSharedDictEntry *entry_ = nullptr;
+};
+} // namespace
+
 int ObIKFTParser::init(const ObFTParserParam &param)
 {
   int ret = OB_SUCCESS;
@@ -50,8 +161,12 @@ int ObIKFTParser::init(const ObFTParserParam &param)
     coll_type_ = ObCollationType::CS_TYPE_INVALID;
     if (OB_ISNULL(param.cs_) || OB_ISNULL(param.cs_->name)) {
       ret = OB_INVALID_ARGUMENT;
+    } else if (ObCharset::is_valid_collation(static_cast<ObCollationType>(param.cs_->number))) {
+      coll_type_ = static_cast<ObCollationType>(param.cs_->number);
     } else if (CS_TYPE_INVALID == (coll_type_ = ObCharset::collation_type(param.cs_->name))) {
       ret = OB_INVALID_ARGUMENT;
+    }
+    if (OB_FAIL(ret)) {
     } else if (OB_FAIL(init_dict(param))) {
     } else if (OB_FAIL(init_ctx(param))) {
     } else if (OB_FAIL(init_segmenter(param))) {
@@ -134,12 +249,11 @@ int ObIKFTParser::process_one_char(TokenizeContext &ctx,
                                    const ObFTCharUtil::CharType type)
 {
   int ret = OB_SUCCESS;
-  // proces by char with all segmenters
-  for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
-       OB_SUCC(ret) && iter != segmenters_.end();
-       iter++) {
-    if (OB_FAIL((*iter)->process(ctx))) {
-    }
+  if (OB_FAIL(letter_seg_->ObIKLetterProcessor::do_process(ctx, ch, char_len, type))) {
+  } else if (OB_FAIL(quan_seg_->ObIKQuantifierProcessor::do_process(ctx, ch, char_len, type))) {
+  } else if (OB_FAIL(cjk_seg_->ObIKCJKProcessor::do_process(ctx, ch, char_len, type))) {
+  } else if (OB_UNLIKELY(nullptr != surrogate_seg_)
+             && OB_FAIL(surrogate_seg_->ObIKSurrogateProcessor::do_process(ctx, ch, char_len, type))) {
   }
   return ret;
 }
@@ -230,45 +344,30 @@ int ObIKFTParserDesc::get_add_word_flag(ObAddWordFlag &flag) const
 
 int ObIKFTParser::init_dict(const ObFTParserParam &param)
 {
+  UNUSED(param);
   int ret = OB_SUCCESS;
-  ObIFTDict *tmp_dict = nullptr;
-
   if (OB_ISNULL(hub_)) {
     ret = OB_ERR_UNEXPECTED;
-  }
-
-  ObFTRangeDict *dict = nullptr;
-  ObFTDictDesc main_dict_desc("main_dict",
-                              ObFTDictType::DICT_IK_MAIN,
-                              ObCharsetType::CHARSET_UTF8MB4,
-                              ObCollationType::CS_TYPE_UTF8MB4_BIN);
-
-  ObFTDictDesc quan_dict_desc("quan_dict",
-                              ObFTDictType::DICT_IK_QUAN,
-                              ObCharsetType::CHARSET_UTF8MB4,
-                              ObCollationType::CS_TYPE_UTF8MB4_BIN);
-
-  ObFTDictDesc stopword_dict_desc("stopword",
-                                  ObFTDictType::DICT_IK_STOP,
-                                  ObCharsetType::CHARSET_UTF8MB4,
-                                  ObCollationType::CS_TYPE_UTF8MB4_BIN);
-
-  if (should_read_newest_table()) {
-    // clear dict cache, always false now
+  } else if (!should_read_newest_table()) {
+    owns_dicts_ = false;
+    dict_stop_ = nullptr;
+    ret = IKSharedDictCache::instance().get(hub_, dict_main_, dict_quan_);
   } else {
+    owns_dicts_ = true;
+    ObFTDictDesc main_dict_desc("main_dict",
+                                ObFTDictType::DICT_IK_MAIN,
+                                ObCharsetType::CHARSET_UTF8MB4,
+                                ObCollationType::CS_TYPE_UTF8MB4_BIN);
+    ObFTDictDesc quan_dict_desc("quan_dict",
+                                ObFTDictType::DICT_IK_QUAN,
+                                ObCharsetType::CHARSET_UTF8MB4,
+                                ObCollationType::CS_TYPE_UTF8MB4_BIN);
     if (OB_FAIL(init_single_dict(main_dict_desc, cache_main_))) {
     } else if (OB_FAIL(init_single_dict(quan_dict_desc, cache_quan_))) {
-    } else if (OB_FAIL(init_single_dict(stopword_dict_desc, cache_stop_))) {
+    } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
+    } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
     }
   }
-
-  if (OB_FAIL(ret)) {
-    // already logged.
-  } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
-  } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
-  } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
-  }
-
   return ret;
 }
 
@@ -309,40 +408,19 @@ int ObIKFTParser::init_ctx(const ObFTParserParam &param)
 
 int ObIKFTParser::init_segmenter(const ObFTParserParam &param)
 {
+  UNUSED(param);
   int ret = OB_SUCCESS;
-  // do have an order
-  ObIKLetterProcessor *letter_seg = nullptr;
-  ObIKQuantifierProcessor *cnqsg = nullptr;
-  ObIKCJKProcessor *cjksg = nullptr;
-  ObIKSurrogateProcessor *surrogate_seg = nullptr;
-  if (OB_ISNULL(letter_seg = OB_NEWx(ObIKLetterProcessor, &allocator_))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_ISNULL(dict_quan_)) {
+  if (OB_ISNULL(dict_quan_) || OB_ISNULL(dict_main_)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_ISNULL(cnqsg = OB_NEWx(ObIKQuantifierProcessor, &allocator_, *dict_quan_, allocator_))) {
+  } else if (OB_ISNULL(letter_seg_ = OB_NEWx(ObIKLetterProcessor, &allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_ISNULL(dict_main_)) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (OB_ISNULL(cjksg = OB_NEWx(ObIKCJKProcessor, &allocator_, *dict_main_, allocator_))) {
+  } else if (OB_ISNULL(quan_seg_ = OB_NEWx(ObIKQuantifierProcessor, &allocator_, *dict_quan_, allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_ISNULL(surrogate_seg = OB_NEWx(ObIKSurrogateProcessor, &allocator_))) {
+  } else if (OB_ISNULL(cjk_seg_ = OB_NEWx(ObIKCJKProcessor, &allocator_, *dict_main_, allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(segmenters_.push_back(letter_seg))) {
-  } else if (FALSE_IT(letter_seg = nullptr)) {
-  } else if (OB_FAIL(segmenters_.push_back(cnqsg))) {
-  } else if (FALSE_IT(cnqsg = nullptr)) {
-  } else if (OB_FAIL(segmenters_.push_back(cjksg))) {
-  } else if (FALSE_IT(cjksg = nullptr)) {
-  } else if (OB_FAIL(segmenters_.push_back(surrogate_seg))) {
-  } else if (OB_FALSE_IT(surrogate_seg = nullptr)) {
-  }
-  // push back by order, quantifier is before cjk
-
-  if (OB_FAIL(ret)) {
-    OB_DELETEx(ObIKLetterProcessor, &allocator_, letter_seg);
-    OB_DELETEx(ObIKQuantifierProcessor, &allocator_, cnqsg);
-    OB_DELETEx(ObIKCJKProcessor, &allocator_, cjksg);
-    OB_DELETEx(ObIKSurrogateProcessor, &allocator_, surrogate_seg);
+  } else if (ObCharset::charset_type_by_coll(coll_type_) != CHARSET_UTF8MB4
+             && OB_ISNULL(surrogate_seg_ = OB_NEWx(ObIKSurrogateProcessor, &allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
   }
   return ret;
 }
@@ -352,32 +430,52 @@ void ObIKFTParser::reset()
   if (!OB_ISNULL(ctx_)) {
     ctx_->~TokenizeContext();
     allocator_.free(ctx_);
+    ctx_ = nullptr;
   }
 
-  for (ObIIKProcessor *segmenter : segmenters_) {
-    if (!OB_ISNULL(segmenter)) {
-      segmenter->~ObIIKProcessor();
-      allocator_.free(segmenter);
+  if (nullptr != letter_seg_) {
+    letter_seg_->~ObIKLetterProcessor();
+    allocator_.free(letter_seg_);
+    letter_seg_ = nullptr;
+  }
+  if (nullptr != quan_seg_) {
+    quan_seg_->~ObIKQuantifierProcessor();
+    allocator_.free(quan_seg_);
+    quan_seg_ = nullptr;
+  }
+  if (nullptr != cjk_seg_) {
+    cjk_seg_->~ObIKCJKProcessor();
+    allocator_.free(cjk_seg_);
+    cjk_seg_ = nullptr;
+  }
+  if (nullptr != surrogate_seg_) {
+    surrogate_seg_->~ObIKSurrogateProcessor();
+    allocator_.free(surrogate_seg_);
+    surrogate_seg_ = nullptr;
+  }
+
+  if (owns_dicts_) {
+    cache_main_.reset();
+    cache_quan_.reset();
+    cache_stop_.reset();
+
+    if (!OB_ISNULL(dict_main_)) {
+      dict_main_->~ObIFTDict();
+      allocator_.free(dict_main_);
+    }
+    if (!OB_ISNULL(dict_quan_)) {
+      dict_quan_->~ObIFTDict();
+      allocator_.free(dict_quan_);
+    }
+    if (!OB_ISNULL(dict_stop_)) {
+      dict_stop_->~ObIFTDict();
+      allocator_.free(dict_stop_);
     }
   }
-  segmenters_.clear();
-
-  cache_main_.reset();
-  cache_quan_.reset();
-  cache_stop_.reset();
-
-  if (!OB_ISNULL(dict_main_)) {
-    dict_main_->~ObIFTDict();
-    allocator_.free(dict_main_);
-  }
-  if (!OB_ISNULL(dict_quan_)) {
-    dict_quan_->~ObIFTDict();
-    allocator_.free(dict_quan_);
-  }
-  if (!OB_ISNULL(dict_stop_)) {
-    dict_stop_->~ObIFTDict();
-    allocator_.free(dict_stop_);
-  }
+  dict_main_ = nullptr;
+  dict_quan_ = nullptr;
+  dict_stop_ = nullptr;
+  owns_dicts_ = false;
 
   is_inited_ = false;
 }

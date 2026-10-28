@@ -372,7 +372,77 @@ int ObExprTokenize::parse_parser_properties(const ObExpr &expr,
   return ret;
 }
 
+namespace
+{
+// Normalizing the parser properties is a pure function of (parser name, user properties) that
+// builds, checks and prints a json tree.  TOKENIZE() is usually called again and again with the
+// same parser and options, so every thread keeps its last result.  作者：FDE WorkMate
+struct TokenizePropsMemo
+{
+  static const int64_t MAX_KEY_LEN = 512;
+  static const int64_t MAX_VALUE_LEN = 1024;
+  TokenizePropsMemo() : valid_(false), name_len_(0), input_len_(0), output_len_(0) {}
+  static bool same(const char *buf, const int64_t len, const ObString &str)
+  {
+    return len == str.length() && (0 == len || 0 == MEMCMP(buf, str.ptr(), len));
+  }
+  bool get(const ObString &name, const ObString &input, ObString &output) const
+  {
+    const bool hit = valid_ && same(name_, name_len_, name) && same(input_, input_len_, input);
+    if (hit) {
+      output.assign_ptr(output_, static_cast<ObString::obstr_size_t>(output_len_));
+    }
+    return hit;
+  }
+  void put(const ObString &name, const ObString &input, const ObString &output)
+  {
+    if (name.length() <= MAX_KEY_LEN && input.length() <= MAX_KEY_LEN
+        && output.length() <= MAX_VALUE_LEN) {
+      name_len_ = name.length();
+      input_len_ = input.length();
+      output_len_ = output.length();
+      MEMCPY(name_, name.ptr(), name_len_);
+      if (input_len_ > 0) {
+        MEMCPY(input_, input.ptr(), input_len_);
+      }
+      if (output_len_ > 0) {
+        MEMCPY(output_, output.ptr(), output_len_);
+      }
+      valid_ = true;
+    }
+  }
+  bool valid_;
+  int64_t name_len_;
+  int64_t input_len_;
+  int64_t output_len_;
+  char name_[MAX_KEY_LEN];
+  char input_[MAX_KEY_LEN];
+  char output_[MAX_VALUE_LEN];
+};
+thread_local TokenizePropsMemo tokenize_props_memo;
+} // namespace
+
 int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &properties)
+{
+  int ret = OB_SUCCESS;
+  ObString cached;
+  if (tokenize_props_memo.get(parser_name_, properties, cached)) {
+    // copy out: the memo buffer is overwritten by the next call on this thread
+    if (OB_FAIL(ob_write_string(allocator_, cached, properties_))) {
+    }
+  } else {
+    // properties may alias properties_, keep the key before it is replaced
+    ObString input;
+    if (OB_FAIL(ob_write_string(allocator_, properties, input))) {
+    } else if (OB_FAIL(do_reform_parser_properties(input))) {
+    } else {
+      tokenize_props_memo.put(parser_name_, input, properties_);
+    }
+  }
+  return ret;
+}
+
+int ObExprTokenize::TokenizeParam::do_reform_parser_properties(const ObString &properties)
 {
   int ret = OB_SUCCESS;
   storage::ObFTParserJsonProps parser_properties;

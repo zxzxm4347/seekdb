@@ -1894,8 +1894,13 @@ int ObTscCgService::generate_text_ir_ctdef(const ObLogTableScan &op,
 
   if (OB_SUCC(ret)) {
     root_ctdef = ir_scan_ctdef;
+    bool relevance_only_for_filter = false;
     if (OB_FAIL(generate_text_ir_spec_exprs(tr_info, *ir_scan_ctdef))) {
+    } else if (!cg_ctx.is_func_lookup_ && !cg_ctx.is_es_match_ && !cg_ctx.is_vec_iter_func_lookup_
+               && !cg_ctx.is_merge_fts_index_
+               && OB_FAIL(check_relevance_only_for_match_filter(op, tr_info, relevance_only_for_filter))) {
     } else {
+      ir_scan_ctdef->relevance_only_for_match_filter_ = relevance_only_for_filter;
       const ObCostTableScanInfo *est_cost_info = op.get_est_cost_info();
       int partition_row_cnt = 0;
       if (nullptr == est_cost_info
@@ -2990,6 +2995,52 @@ int ObTscCgService::generate_spiv_block_max_spec(
     block_max_spec.min_id_idx_ = 0;
     block_max_spec.max_id_idx_ = 1;
     block_max_spec.value_idx_ = 2;
+  }
+  return ret;
+}
+
+// The BM25 score is needed only when someone reads it: an output/filter of the scan, a sort key,
+// or a predicate other than the bare `MATCH(...)` truth test.  In natural language mode every
+// matched document scores > 0 (idf has a positive floor and tf >= 1), so the bare truth test is
+// already implied by "the document matched".  作者：FDE WorkMate
+int ObTscCgService::check_relevance_only_for_match_filter(const ObLogTableScan &op,
+                                                         const ObTextRetrievalInfo &tr_info,
+                                                         bool &only_for_filter) const
+{
+  int ret = OB_SUCCESS;
+  only_for_filter = false;
+  const ObRawExpr *match_expr = tr_info.match_expr_;
+  const ObRawExpr *filter = tr_info.pushdown_match_filter_;
+  bool is_bare_match_filter = false;
+  if (OB_ISNULL(match_expr) || OB_ISNULL(filter)) {
+  } else if (filter == match_expr) {
+    is_bare_match_filter = true;
+  } else if (T_OP_BOOL == filter->get_expr_type() && 1 == filter->get_param_count()
+             && filter->get_param_expr(0) == match_expr) {
+    is_bare_match_filter = true;
+  }
+  if (!is_bare_match_filter
+      || !tr_info.need_calc_relevance_
+      || tr_info.need_sort()
+      || nullptr != tr_info.topk_limit_expr_
+      || NATURAL_LANGUAGE_MODE != tr_info.match_expr_->get_mode_flag()
+      || op.get_index_back()) {
+    // keep relevance
+  } else {
+    bool used = false;
+    const ObIArray<ObRawExpr *> &outputs = op.get_output_exprs();
+    const ObIArray<ObRawExpr *> &filters = op.get_filter_exprs();
+    for (int64_t i = 0; OB_SUCC(ret) && !used && i < outputs.count(); ++i) {
+      if (OB_FAIL(ObRawExprUtils::find_expr(outputs.at(i), match_expr, used))) {
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !used && i < filters.count(); ++i) {
+      if (OB_FAIL(ObRawExprUtils::find_expr(filters.at(i), match_expr, used))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      only_for_filter = !used;
+    }
   }
   return ret;
 }

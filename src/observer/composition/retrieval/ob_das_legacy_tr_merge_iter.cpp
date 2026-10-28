@@ -105,7 +105,7 @@ int ObDASLegacyTRMergeIter::init_das_iter_scan_params()
 {
   int ret = OB_SUCCESS;
   const int64_t dim_iter_cnt = taat_mode_ ? 1 : query_tokens_.count();
-  if (!ir_ctdef_->need_estimate_total_doc_cnt() && 0 != dim_iter_cnt) {
+  if (!skip_relevance() && !ir_ctdef_->need_estimate_total_doc_cnt() && 0 != dim_iter_cnt) {
     void *buf = nullptr;
     if (OB_ISNULL(buf = myself_allocator_.alloc(sizeof(ObTableScanParam)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -130,7 +130,7 @@ int ObDASLegacyTRMergeIter::init_das_iter_scan_params()
     } else if (OB_FAIL(inv_scan_params_.prepare_allocate(dim_iter_cnt))) {
     }
 
-    if (OB_FAIL(ret) || !ir_ctdef_->need_inv_idx_agg()) {
+    if (OB_FAIL(ret) || skip_relevance() || !ir_ctdef_->need_inv_idx_agg()) {
     } else if (FALSE_IT(inv_agg_params_.set_allocator(&myself_allocator_))) {
     } else if (OB_FAIL(inv_agg_params_.init(dim_iter_cnt))) {
     } else if (OB_FAIL(inv_agg_params_.prepare_allocate(dim_iter_cnt))) {
@@ -155,7 +155,7 @@ int ObDASLegacyTRMergeIter::init_das_iter_scan_params()
         }
       }
 
-      if (OB_SUCC(ret) && ir_ctdef_->need_inv_idx_agg()) {
+      if (OB_SUCC(ret) && !skip_relevance() && ir_ctdef_->need_inv_idx_agg()) {
         void *agg_buf = nullptr;
         if (OB_ISNULL(agg_buf = myself_allocator_.alloc(sizeof(ObTableScanParam) * dim_iter_cnt))) {
           ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -349,7 +349,7 @@ int ObDASLegacyTRMergeIter::init_dim_iter_param(ObTextRetrievalScanIterParam &it
     const int64_t dim_iter_cnt = taat_mode_ ? 1 : query_tokens_.count();
     iter_param.inv_idx_scan_param_ = inv_scan_params_[idx];
     iter_param.inv_idx_scan_iter_ = static_cast<ObDASScanIter*>(children_[idx]);
-    if (ir_ctdef_->need_inv_idx_agg()) {
+    if (!skip_relevance() && ir_ctdef_->need_inv_idx_agg()) {
       iter_param.inv_idx_agg_param_ = inv_agg_params_[idx];
       iter_param.inv_idx_agg_iter_ = static_cast<ObDASScanIter*>(children_[idx + dim_iter_cnt]);
       if (OB_UNLIKELY(1 != ir_ctdef_->get_inv_idx_agg_ctdef()
@@ -365,6 +365,12 @@ int ObDASLegacyTRMergeIter::init_dim_iter_param(ObTextRetrievalScanIterParam &it
     iter_param.eval_ctx_ = ir_rtdef_->eval_ctx_;
     iter_param.relevance_expr_ = ir_ctdef_->relevance_expr_;
     iter_param.inv_scan_doc_length_col_ = ir_ctdef_->inv_scan_doc_length_col_;
+    if (skip_relevance()) {
+      // the score is never read, only whether a document contains the token
+      iter_param.relevance_expr_ = nullptr;
+      iter_param.inv_idx_agg_iter_ = nullptr;
+      iter_param.inv_idx_agg_expr_ = nullptr;
+    }
     iter_param.inv_scan_domain_id_col_ = ir_ctdef_->inv_scan_domain_id_col_;
     iter_param.inv_idx_agg_cache_mode_ = function_lookup_mode_ && !taat_mode_;
   }
@@ -382,6 +388,13 @@ int ObDASLegacyTRMergeIter::create_sparse_retrieval_iter()
   sr_iter_param_.relevance_proj_expr_ = ir_ctdef_->relevance_proj_col_;
   sr_iter_param_.filter_expr_ = ir_ctdef_->match_filter_;
   sr_iter_param_.topk_limit_ = topk_limit_;
+  if (skip_relevance()) {
+    // MATCH(...) as a bare truth test is equivalent to "document matched" in natural language
+    // mode, see ObDASIRScanCtDef::relevance_only_for_match_filter_.  作者：FDE WorkMate
+    sr_iter_param_.relevance_expr_ = nullptr;
+    sr_iter_param_.relevance_proj_expr_ = nullptr;
+    sr_iter_param_.filter_expr_ = nullptr;
+  }
   if (OB_NOT_NULL(ir_ctdef_->field_boost_expr_)) {
     ObDatum *boost_datum = nullptr;
     if (OB_FAIL(ir_ctdef_->field_boost_expr_->eval(*ir_rtdef_->eval_ctx_, boost_datum))) {
@@ -480,7 +493,7 @@ int ObDASLegacyTRMergeIter::init_daat_iter_param(ObTextDaaTParam &iter_param)
   iter_param.bm25_param_est_ctx_.can_est_by_sum_skip_index_ = ir_ctdef_->avg_doc_len_est_spec_.can_est_by_sum_skip_index_;
   iter_param.bm25_param_est_ctx_.avg_doc_token_cnt_expr_ = ir_ctdef_->avg_doc_token_cnt_expr_;
   iter_param.bm25_param_est_ctx_.doc_length_est_param_ = &doc_length_est_param_;
-  if (query_tokens_.count() == 0) {
+  if (query_tokens_.count() == 0 || skip_relevance()) {
     // do nothing
   } else if (OB_ISNULL(iter_param.bm25_param_est_ctx_.total_doc_cnt_expr_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -556,7 +569,7 @@ int ObDASLegacyTRMergeIter::set_children_iter_rangekey()
   } else if (OB_UNLIKELY(0 == query_tokens_.count())) {
     // do nothing
   } else if (OB_UNLIKELY(inv_scan_params_.empty()
-      || (ir_ctdef_->need_inv_idx_agg() && inv_agg_params_.empty()))) {
+      || (!skip_relevance() && ir_ctdef_->need_inv_idx_agg() && inv_agg_params_.empty()))) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     const ExprFixedArray *exprs = &(ir_ctdef_->get_inv_idx_scan_ctdef()->pd_expr_spec_.access_exprs_);
@@ -571,7 +584,7 @@ int ObDASLegacyTRMergeIter::set_children_iter_rangekey()
     const int64_t dim_iter_cnt = taat_mode_ ? 1 : query_tokens_.count();
     for (int64_t i = 0; OB_SUCC(ret) && i < dim_iter_cnt; ++i) {
       if (OB_FAIL(gen_inv_idx_scan_default_range(query_tokens_[i], inv_idx_scan_range))) {
-      } else if (ir_ctdef_->need_inv_idx_agg()
+      } else if (!skip_relevance() && ir_ctdef_->need_inv_idx_agg()
           && OB_FAIL(inv_agg_params_[i]->key_ranges_.push_back(inv_idx_scan_range))) {
       } else if (FALSE_IT(inv_idx_scan_range.group_idx_ = group_idx)) {
       } else if (OB_FAIL(inv_scan_params_[i]->key_ranges_.push_back(inv_idx_scan_range))) {
@@ -1111,7 +1124,7 @@ int ObDASLegacyTRMergeIter::build_query_tokens(const ObDASIRScanCtDef *ir_ctdef,
     int64_t doc_length = 0;
     storage::ObFTParseHelper tokenize_helper;
     common::ObSEArray<ObFTWord, 16> tokens;
-    hash::ObHashMap<ObFTWord, int64_t> token_map;
+    storage::ObFTWordMap token_map;
     const int64_t ft_word_bkt_cnt = MAX(search_text_string.length() / 10, 2);
     if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
     } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
@@ -1122,7 +1135,7 @@ int ObDASLegacyTRMergeIter::build_query_tokens(const ObDASIRScanCtDef *ir_ctdef,
                            doc_length,
                            token_map))) {
     } else {
-      for (hash::ObHashMap<ObFTWord, int64_t>::const_iterator iter = token_map.begin();
+      for (storage::ObFTWordMap::const_iterator iter = token_map.begin();
           OB_SUCC(ret) && iter != token_map.end();
           ++iter) {
         const ObFTWord &token = iter->first;

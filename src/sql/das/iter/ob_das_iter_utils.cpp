@@ -1497,7 +1497,13 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
       merge_iter_param.topk_mode_ = 1;
       merge_iter_param.daat_mode_ = 1;
     } else if (merge_iter_param.query_tokens_.count() > OB_MAX_TEXT_RETRIEVAL_TOKEN_CNT
-        || (!is_func_lookup && !ir_scan_ctdef->need_proj_relevance_score())) {
+        || (!is_func_lookup && !ir_scan_ctdef->need_proj_relevance_score()
+            && !(ir_scan_ctdef->can_skip_relevance()
+                 && nullptr != ir_scan_rtdef->get_inv_idx_scan_rtdef()
+                 && ir_scan_rtdef->get_inv_idx_scan_rtdef()->limit_param_.is_valid()))) {
+      // TaaT has to collect every matched document before it returns the first one.  When only
+      // "document matched" is needed and a limit is pushed down, DaaT streams the documents in
+      // id order and stops at the limit, so it is kept for that case.  作者：FDE WorkMate
       if (BOOLEAN_MODE == ir_scan_ctdef->mode_flag_) {
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "Boolean mode with more than 256 tokens is");
@@ -1526,7 +1532,12 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
     }
   }
 
-  for (int64_t i = 0; ir_scan_ctdef->need_inv_idx_agg() && OB_SUCC(ret) && i < size; ++i) {
+  const bool skip_relevance = merge_iter_param.daat_mode_
+      && !merge_iter_param.topk_mode_
+      && !merge_iter_param.function_lookup_mode_
+      && ir_scan_ctdef->can_skip_relevance();
+
+  for (int64_t i = 0; !skip_relevance && ir_scan_ctdef->need_inv_idx_agg() && OB_SUCC(ret) && i < size; ++i) {
     ObDASScanIterParam inv_idx_agg_iter_param;
     ObDASScanIter *inv_idx_agg_iter = nullptr;
     init_scan_iter_param(inv_idx_agg_iter_param, ir_scan_ctdef->get_inv_idx_agg_ctdef(), ir_scan_rtdef);
@@ -1537,7 +1548,7 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
   }
 
   if (OB_FAIL(ret)) {
-  } else if (size > 0 && !ir_scan_ctdef->need_estimate_total_doc_cnt()) {
+  } else if (size > 0 && !skip_relevance && !ir_scan_ctdef->need_estimate_total_doc_cnt()) {
     ObDASScanIterParam doc_cnt_agg_param;
     ObDASScanIter *doc_cnt_agg_iter = nullptr;
     init_scan_iter_param(doc_cnt_agg_param, ir_scan_ctdef->get_doc_agg_ctdef(), ir_scan_rtdef);
