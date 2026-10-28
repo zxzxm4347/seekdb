@@ -22,5 +22,6 @@ private:
   std::mutex install_mutex_;
   bool started_ = false;
   std::atomic<bool> recovered_{false};
+  std::atomic<bool> has_ai_columns_{false};
 };
 }}

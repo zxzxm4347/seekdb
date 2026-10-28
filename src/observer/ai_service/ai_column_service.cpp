@@ -263,7 +263,7 @@ int AiColumnService::start_service()
 {
   std::lock_guard<std::mutex> lock(lifecycle_mutex_);
   if (started_) return OB_SUCCESS;
-  recovered_.store(false); set_thread_count(4);
+  recovered_.store(false); has_ai_columns_.store(false); set_thread_count(4);
   set_run_wrapper(lib::Threads::get_expect_run_wrapper());
   int ret = start(); if (OB_SUCC(ret)) started_ = true; return ret;
 }
@@ -275,6 +275,21 @@ void AiColumnService::stop_service()
 int AiColumnService::install_table(uint64_t table_id, bool initialize_rows)
 {
   if (!GCTX.schema_service_ || !GCTX.sql_proxy_) return OB_NOT_INIT;
+  {
+    ObSchemaGetterGuard fast_guard;
+    const ObTableSchema *fast_table = nullptr;
+    int fast_ret = OB_SUCCESS;
+    if (OB_FAIL(fast_ret = GCTX.schema_service_->get_runtime_schema_guard(fast_guard))) return fast_ret;
+    if (OB_FAIL(fast_ret = fast_guard.get_table_schema(table_id, fast_table))) return fast_ret;
+    if (!fast_table) return OB_TABLE_NOT_EXIST;
+    bool has_ai = false;
+    for (int64_t i = 0; i < fast_table->get_column_count(); ++i) {
+      const auto *col = fast_table->get_column_schema_by_idx(i);
+      if (col && col->is_ai_column()) { has_ai = true; break; }
+    }
+    if (!has_ai) return OB_SUCCESS;
+    has_ai_columns_.store(true);
+  }
   std::lock_guard<std::mutex> lock(install_mutex_);
   int ret = OB_SUCCESS;
   try {
@@ -432,21 +447,30 @@ int AiColumnService::install_table(uint64_t table_id, bool initialize_rows)
 int AiColumnService::recover()
 {
   if (!GCTX.sql_proxy_ || !GCTX.schema_service_) return OB_NOT_INIT;
-  int ret = write_sql(*GCTX.sql_proxy_, "UPDATE " + std::string(TASKS)
-      + " SET claim_id=NULL,lease_until=NULL,state=IF(state=1,0,state) WHERE claim_id IS NOT NULL OR state=1");
-  if (OB_SUCC(ret)) {
+  if (!GCTX.schema_service_->is_runtime_schema_refreshed()) return OB_EAGAIN;
+  int ret = OB_SUCCESS;
+  ObSEArray<uint64_t, 8> ai_table_ids;
+  {
     ObSchemaGetterGuard guard;
     ObSEArray<const ObTableSchema *, 16> tables;
-    if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(guard))) {
-    } else if (OB_FAIL(guard.get_table_schemas_in_runtime(tables))) {
-    } else {
-      for (const auto *table : tables) {
-        if (!table || table->is_index_table() || table->is_view_table() || table->is_in_recyclebin()) continue;
-        bool ai = false;
-        for (int64_t i = 0; i < table->get_column_count(); ++i) ai |= table->get_column_schema_by_idx(i)->is_ai_column();
-        if (ai && OB_FAIL(install_table(table->get_table_id(), true))) break;
+    if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(guard))) return ret;
+    if (OB_FAIL(guard.get_table_schemas_in_runtime(tables))) return ret;
+    for (const auto *table : tables) {
+      if (!table || table->is_index_table() || table->is_view_table() || table->is_in_recyclebin()) continue;
+      bool ai = false;
+      for (int64_t i = 0; i < table->get_column_count(); ++i) {
+        const auto *col = table->get_column_schema_by_idx(i);
+        if (col && col->is_ai_column()) { ai = true; break; }
       }
+      if (ai && OB_FAIL(ai_table_ids.push_back(table->get_table_id()))) return ret;
     }
+  }
+  if (ai_table_ids.empty()) return OB_SUCCESS;
+  has_ai_columns_.store(true);
+  ret = write_sql(*GCTX.sql_proxy_, "UPDATE " + std::string(TASKS)
+      + " SET claim_id=NULL,lease_until=NULL,state=IF(state=1,0,state) WHERE claim_id IS NOT NULL OR state=1");
+  for (int64_t i = 0; OB_SUCC(ret) && i < ai_table_ids.count(); ++i) {
+    ret = install_table(ai_table_ids.at(i), true);
   }
   return ret;
 }
@@ -455,6 +479,7 @@ int AiColumnService::process_group()
 {
   int ret = OB_SUCCESS;
   if (!GCTX.sql_proxy_) return OB_NOT_INIT;
+  if (!has_ai_columns_.load()) return OB_ITER_END;
   // Idle polling is read-only; acquire a transactional lock only when work is due.
   // This also avoids repeatedly creating and rolling back empty transactions.
   {
