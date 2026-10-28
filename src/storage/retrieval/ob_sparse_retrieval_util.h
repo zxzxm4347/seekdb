@@ -39,6 +39,14 @@ OB_INLINE int bytewise_null_first_cmp(const ObDatum &l, const ObDatum &r)
   int cmp_ret = 0;
   if (OB_UNLIKELY(l.is_null() || r.is_null())) {
     cmp_ret = l.is_null() ? (r.is_null() ? 0 : -1) : 1;
+  } else if (OB_LIKELY(8 == l.len_ && 8 == r.len_)) {
+    uint64_t lv = 0;
+    uint64_t rv = 0;
+    MEMCPY(&lv, l.ptr_, sizeof(uint64_t));
+    MEMCPY(&rv, r.ptr_, sizeof(uint64_t));
+    lv = __builtin_bswap64(lv);
+    rv = __builtin_bswap64(rv);
+    cmp_ret = (lv < rv) ? -1 : ((lv > rv) ? 1 : 0);
   } else {
     const uint32_t len = MIN(l.len_, r.len_);
     const int c = 0 == len ? 0 : memcmp(l.ptr_, r.ptr_, len);

@@ -927,6 +927,8 @@ int ObFtsIndexBuildTask::on_child_task_finish(
                                                                  status,
                                                                  true/*overwrite*/))) {
     } else {
+      delay_schedule_time_ = 0;
+      enable_schedule();
       LOG_INFO("child task finish successfully", K(child_task_key));
     }
   }

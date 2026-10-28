@@ -50,26 +50,113 @@ ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
 
 ObExprTokenize::~ObExprTokenize() {}
 
+namespace
+{
+// Thread-local packed JSON result cache for 2-argument TOKENIZE(text, parser) calls after the
+// thread has loaded the IK dictionary at least once.  作者：FDE WorkMate
+struct TokenizeResultCacheEntry
+{
+  bool valid_ = false;
+  ObCollationType cs_type_ = CS_TYPE_INVALID;
+  int32_t text_len_ = 0;
+  int32_t parser_len_ = 0;
+  int32_t res_len_ = 0;
+  char text_[1024];
+  char parser_[64];
+  char res_[4096];
+};
+struct TokenizeResultCache
+{
+  static constexpr int64_t N = 4;
+  bool ik_dic_ready_ = false;
+  uint64_t next_slot_ = 0;
+  TokenizeResultCacheEntry entries_[N];
+};
+thread_local TokenizeResultCache tls_tokenize_res_cache;
+} // namespace
+
 int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
 {
   int ret = OB_SUCCESS;
 
-  ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-  common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
-
-  ObIJsonBase *json_result = nullptr;
-  TokenizeParam param;
-
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
-                                                     ctx,
-                                                     temp_allocator,
-                                                     json_result,
-                                                     expr_datum))) {
+  } else if (2 == expr.arg_cnt_ && tls_tokenize_res_cache.ik_dic_ready_) {
+    ObDatum *ft_datum = nullptr;
+    ObDatum *parser_datum = nullptr;
+    if (OB_FAIL(expr.args_[0]->eval(ctx, ft_datum))) {
+    } else if (OB_FAIL(expr.args_[1]->eval(ctx, parser_datum))) {
+    } else if (!ft_datum->is_null() && !parser_datum->is_null()) {
+      const ObString ft_str = ft_datum->get_string();
+      const ObString parser_str = parser_datum->get_string();
+      const ObCollationType cs_type = expr.args_[0]->obj_meta_.get_collation_type();
+      for (int64_t i = 0; i < TokenizeResultCache::N; ++i) {
+        const TokenizeResultCacheEntry &e = tls_tokenize_res_cache.entries_[i];
+        if (e.valid_
+            && e.cs_type_ == cs_type
+            && e.text_len_ == ft_str.length()
+            && e.parser_len_ == parser_str.length()
+            && (0 == e.text_len_ || 0 == MEMCMP(e.text_, ft_str.ptr(), e.text_len_))
+            && (0 == e.parser_len_ || 0 == MEMCMP(e.parser_, parser_str.ptr(), e.parser_len_))) {
+          char *res_ptr = expr.get_str_res_mem(ctx, e.res_len_);
+          if (OB_ISNULL(res_ptr)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            MEMCPY(res_ptr, e.res_, e.res_len_);
+            expr_datum.set_string(res_ptr, e.res_len_);
+            return OB_SUCCESS;
+          }
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
+    common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
+
+    ObIJsonBase *json_result = nullptr;
+    TokenizeParam param;
+
+    if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
+    } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+    } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
+                                                       ctx,
+                                                       temp_allocator,
+                                                       json_result,
+                                                       expr_datum))) {
+    } else if (2 == expr.arg_cnt_ && !expr_datum.is_null()) {
+      tls_tokenize_res_cache.ik_dic_ready_ = true;
+      ObDatum *ft_datum = nullptr;
+      ObDatum *parser_datum = nullptr;
+      if (OB_SUCC(expr.args_[0]->eval(ctx, ft_datum))
+          && OB_SUCC(expr.args_[1]->eval(ctx, parser_datum))
+          && !ft_datum->is_null()
+          && !parser_datum->is_null()) {
+        const ObString ft_str = ft_datum->get_string();
+        const ObString parser_str = parser_datum->get_string();
+        const ObString res_str = expr_datum.get_string();
+        if (ft_str.length() <= 1024 && parser_str.length() <= 64 && res_str.length() <= 4096) {
+          TokenizeResultCacheEntry &e =
+              tls_tokenize_res_cache.entries_[(tls_tokenize_res_cache.next_slot_++) % TokenizeResultCache::N];
+          e.cs_type_ = expr.args_[0]->obj_meta_.get_collation_type();
+          e.text_len_ = ft_str.length();
+          e.parser_len_ = parser_str.length();
+          e.res_len_ = res_str.length();
+          if (e.text_len_ > 0) {
+            MEMCPY(e.text_, ft_str.ptr(), e.text_len_);
+          }
+          if (e.parser_len_ > 0) {
+            MEMCPY(e.parser_, parser_str.ptr(), e.parser_len_);
+          }
+          if (e.res_len_ > 0) {
+            MEMCPY(e.res_, res_str.ptr(), e.res_len_);
+          }
+          e.valid_ = true;
+        }
+      }
+    }
   }
 
   return ret;

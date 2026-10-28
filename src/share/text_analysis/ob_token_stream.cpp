@@ -249,7 +249,9 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
   } else {
     next_token.reset();
     token_freq = 0;
-    norm_allocator_.reuse();
+    if (OB_UNLIKELY(norm_allocator_.used() > 0)) {
+      norm_allocator_.reuse();
+    }
     ObDatum tmp_datum;
     bool found_alnum = false;
     uint32_t norm_token_len = 0;

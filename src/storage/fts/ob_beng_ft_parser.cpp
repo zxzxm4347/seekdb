@@ -49,11 +49,12 @@ int ObBEngFTParser::get_next_token(
     }
   } else if (OB_ISNULL(token.ptr_) || OB_UNLIKELY(0 >= token.len_ || 0 >= token_freq)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(token.len_)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
-    MEMCPY(buf, token.ptr_, token.len_);
-    word = buf;
+    // token.ptr_ stays valid in the normalizer buffer until the next get_next_token() call, and
+    // ObAddWord::groupby_word copies newly inserted words into its own arena.  Avoid copying every
+    // token (including stopwords and duplicate occurrences) into allocator_ here.  作者：FDE WorkMate
+    UNUSED(buf);
+    word = token.ptr_;
     word_len = token.len_;
     char_len = token.len_;
     word_freq = token_freq;

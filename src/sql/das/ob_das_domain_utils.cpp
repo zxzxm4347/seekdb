@@ -283,50 +283,60 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
                                                              ObDomainIndexRow &word_rows)
 {
   int ret = OB_SUCCESS;
-  static int64_t FT_WORD_DOC_COL_CNT = 4;
+  static constexpr int64_t FT_WORD_DOC_COL_CNT = 4;
   static constexpr int64_t FT_MAX_WORD_BUCKET = 997;
-  const int64_t ft_word_bkt_cnt = MIN(MAX(fulltext.length() / 10, 2), FT_MAX_WORD_BUCKET);
   int64_t doc_length = 0;
-  ObFTWordMap ft_word_map;
+  // Reuse a thread-local hash map across documents and allocate all ObStorageDatums for the
+  // document's unique words in a single arena block instead of per-row init().  作者：FDE WorkMate
+  thread_local ObFTWordMap tls_ft_word_map;
   void *rows_buf = nullptr;
+  void *datums_buf = nullptr;
   blocksstable::ObDatumRow *rows = nullptr;
+  blocksstable::ObStorageDatum *datums = nullptr;
   if (OB_ISNULL(helper) || OB_UNLIKELY(!ft_obj_meta.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (0 == fulltext.length()) {
     ret = OB_ITER_END;
-  } else if (OB_FAIL(ft_word_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+  } else if (!tls_ft_word_map.created()
+             && OB_FAIL(tls_ft_word_map.create(FT_MAX_WORD_BUCKET, common::ObMemAttr("FTWordMap")))) {
+  } else if (FALSE_IT(tls_ft_word_map.reuse())) {
   } else if (OB_FAIL(segment_and_calc_word_count(allocator,
                                                  helper,
                                                  ft_obj_meta,
                                                  fulltext,
                                                  doc_length,
-                                                 ft_word_map))) {
-  } else if (0 == ft_word_map.size()) {
+                                                 tls_ft_word_map))) {
+  } else if (0 == tls_ft_word_map.size()) {
     ret = OB_ITER_END;
-  } else if (OB_ISNULL(rows_buf = reinterpret_cast<char *>(
-                           allocator.alloc(ft_word_map.size() * sizeof(blocksstable::ObDatumRow))))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
-    int64_t i = 0;
-    rows = new (rows_buf) blocksstable::ObDatumRow[ft_word_map.size()];
-    for (ObFTWordMap::const_iterator iter = ft_word_map.begin();
-         OB_SUCC(ret) && iter != ft_word_map.end();
-         ++iter) {
-      if (OB_FAIL(rows[i].init(allocator, FT_WORD_DOC_COL_CNT))) {
-      } else {
-        const ObFTWord &ft_word = iter->first;
+    const int64_t map_size = tls_ft_word_map.size();
+    if (OB_ISNULL(rows_buf = allocator.alloc(map_size * sizeof(blocksstable::ObDatumRow)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_ISNULL(datums_buf = allocator.alloc(
+                             map_size * FT_WORD_DOC_COL_CNT * sizeof(blocksstable::ObStorageDatum)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(word_rows.reserve(map_size))) {
+    } else {
+      int64_t i = 0;
+      rows = new (rows_buf) blocksstable::ObDatumRow[map_size];
+      datums = new (datums_buf) blocksstable::ObStorageDatum[map_size * FT_WORD_DOC_COL_CNT];
+      const int64_t word_idx = is_fts_index_aux ? 0 : 1;
+      const int64_t doc_id_idx = is_fts_index_aux ? 1 : 0;
+      const int64_t word_cnt_idx = 2;
+      const int64_t doc_len_idx = 3;
+      for (ObFTWordMap::const_iterator iter = tls_ft_word_map.begin();
+           OB_SUCC(ret) && iter != tls_ft_word_map.end();
+           ++iter) {
+        const storage::ObFTWord &ft_word = iter->first;
         const int64_t word_cnt = iter->second;
-        // index row format
-        //  -    FTS_INDEX: [WORD], [DOC_ID], [WORD_COUNT], [DOC_LENGTH]
-        //  - FTS_DOC_WORD: [DOC_ID], [WORD], [WORD_COUNT], [DOC_LENGTH]
-        const int64_t word_idx = is_fts_index_aux ? 0 : 1;
-        const int64_t doc_id_idx = is_fts_index_aux ? 1 : 0;
-        const int64_t word_cnt_idx = 2;
-        const int64_t doc_len_idx = 3;
-        rows[i].storage_datums_[word_idx].set_datum(ft_word.get_word());
-        rows[i].storage_datums_[doc_id_idx].shallow_copy_from_datum(doc_id_datum);
-        rows[i].storage_datums_[word_cnt_idx].set_uint(word_cnt);
-        rows[i].storage_datums_[doc_len_idx].set_uint(doc_length);
+        blocksstable::ObStorageDatum *row_datums = &datums[i * FT_WORD_DOC_COL_CNT];
+        rows[i].storage_datums_ = row_datums;
+        rows[i].count_ = FT_WORD_DOC_COL_CNT;
+        rows[i].row_flag_.set_flag(blocksstable::ObDmlFlag::DF_INSERT);
+        row_datums[word_idx].set_datum(ft_word.get_word());
+        row_datums[doc_id_idx].shallow_copy_from_datum(doc_id_datum);
+        row_datums[word_cnt_idx].set_uint(word_cnt);
+        row_datums[doc_len_idx].set_uint(doc_length);
         if (OB_FAIL(word_rows.push_back(&rows[i]))) {
         } else {
           ++i;

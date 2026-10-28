@@ -1050,12 +1050,12 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
         break;
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        // Building the inverted tables tokenizes, sorts and writes every word of every document,
-        // which is CPU bound.  Without an explicit degree (the default 1) a single PX worker
-        // does all of it, so pick a small cpu-bounded degree instead.  作者：FDE WorkMate
-        decided_parallelism = original_parallelism > 1
-            ? MAX(original_parallelism / 3, 1L)
-            : MIN(FTS_AUTO_MAX_PARALLELISM, MAX(1L, static_cast<int64_t>(common::get_cpu_num()) / 2));
+        // ObDDLLocalBuilder runs the three auxiliary table builds (_doc_rowkey, _fts_index,
+        // _fts_doc_word) concurrently on separate worker threads.  Keep each build at DOP 1 when
+        // no explicit PARALLEL hint is given so that it executes directly on the builder thread
+        // without a 2-DFO PX range-partition exchange or PX worker admission contention.
+        // 作者：FDE WorkMate
+        decided_parallelism = MAX(original_parallelism / 3, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:

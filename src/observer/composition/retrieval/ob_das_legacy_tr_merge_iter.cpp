@@ -1119,29 +1119,120 @@ int ObDASLegacyTRMergeIter::build_query_tokens(const ObDASIRScanCtDef *ir_ctdef,
     const ObString &search_text_string = search_text_datum->get_string();
     const ObString &parser_name = ir_ctdef->get_inv_idx_scan_ctdef()->table_param_.get_parser_name();
     const ObString &parser_properties = ir_ctdef->get_inv_idx_scan_ctdef()->table_param_.get_parser_property();
-
     const ObObjMeta &meta = search_text->obj_meta_;
-    int64_t doc_length = 0;
-    storage::ObFTParseHelper tokenize_helper;
-    common::ObSEArray<ObFTWord, 16> tokens;
-    storage::ObFTWordMap token_map;
-    const int64_t ft_word_bkt_cnt = MAX(search_text_string.length() / 10, 2);
-    if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
-    } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
-    } else if (OB_FAIL(tokenize_helper.segment(
-                           meta,
-                           search_text_string.ptr(),
-                           search_text_string.length(),
-                           doc_length,
-                           token_map))) {
-    } else {
-      for (storage::ObFTWordMap::const_iterator iter = token_map.begin();
-          OB_SUCC(ret) && iter != token_map.end();
-          ++iter) {
-        const ObFTWord &token = iter->first;
+
+    // Small thread-local cache of tokenized natural-language query terms keyed by
+    // (collation, parser_name, parser_properties, search_text_string).  作者：FDE WorkMate
+    struct QueryTokenCacheEntry
+    {
+      bool valid_ = false;
+      ObCollationType cs_type_ = CS_TYPE_INVALID;
+      int32_t name_len_ = 0;
+      int32_t props_len_ = 0;
+      int32_t text_len_ = 0;
+      int32_t token_cnt_ = 0;
+      char name_[64];
+      char props_[256];
+      char text_[512];
+      int32_t tok_off_[16];
+      int32_t tok_len_[16];
+      char tok_buf_[512];
+    };
+    struct QueryTokenCache
+    {
+      enum { N = 4 };
+      uint64_t next_slot_ = 0;
+      QueryTokenCacheEntry entries_[N];
+    };
+    thread_local QueryTokenCache tls_query_cache;
+
+    const ObCollationType cs_type = meta.get_collation_type();
+    int64_t hit_idx = -1;
+    for (int64_t i = 0; i < QueryTokenCache::N; ++i) {
+      const QueryTokenCacheEntry &e = tls_query_cache.entries_[i];
+      if (e.valid_
+          && e.cs_type_ == cs_type
+          && e.name_len_ == parser_name.length()
+          && e.props_len_ == parser_properties.length()
+          && e.text_len_ == search_text_string.length()
+          && (0 == e.name_len_ || 0 == MEMCMP(e.name_, parser_name.ptr(), e.name_len_))
+          && (0 == e.props_len_ || 0 == MEMCMP(e.props_, parser_properties.ptr(), e.props_len_))
+          && (0 == e.text_len_ || 0 == MEMCMP(e.text_, search_text_string.ptr(), e.text_len_))) {
+        hit_idx = i;
+        break;
+      }
+    }
+
+    if (hit_idx >= 0) {
+      const QueryTokenCacheEntry &e = tls_query_cache.entries_[hit_idx];
+      for (int32_t i = 0; OB_SUCC(ret) && i < e.token_cnt_; ++i) {
+        ObString cached_tok(e.tok_len_[i], e.tok_buf_ + e.tok_off_[i]);
         ObString token_string;
-        if (OB_FAIL(ob_write_string(alloc, token.get_word().get_string(), token_string))) {
+        if (OB_FAIL(ob_write_string(alloc, cached_tok, token_string))) {
         } else if (OB_FAIL(query_tokens.push_back(token_string))) {
+        }
+      }
+    } else {
+      int64_t doc_length = 0;
+      storage::ObFTParseHelper tokenize_helper;
+      storage::ObFTWordMap token_map;
+      const int64_t ft_word_bkt_cnt = MAX(search_text_string.length() / 10, 2);
+      if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
+      } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+      } else if (OB_FAIL(tokenize_helper.segment(
+                             meta,
+                             search_text_string.ptr(),
+                             search_text_string.length(),
+                             doc_length,
+                             token_map))) {
+      } else {
+        for (storage::ObFTWordMap::const_iterator iter = token_map.begin();
+            OB_SUCC(ret) && iter != token_map.end();
+            ++iter) {
+          const ObFTWord &token = iter->first;
+          ObString token_string;
+          if (OB_FAIL(ob_write_string(alloc, token.get_word().get_string(), token_string))) {
+          } else if (OB_FAIL(query_tokens.push_back(token_string))) {
+          }
+        }
+        if (OB_SUCC(ret)
+            && parser_name.length() <= 64
+            && parser_properties.length() <= 256
+            && search_text_string.length() <= 512
+            && query_tokens.count() <= 16) {
+          int32_t total_tok_bytes = 0;
+          for (int64_t i = 0; i < query_tokens.count(); ++i) {
+            total_tok_bytes += query_tokens.at(i).length();
+          }
+          if (total_tok_bytes <= 512) {
+            QueryTokenCacheEntry &e =
+                tls_query_cache.entries_[(tls_query_cache.next_slot_++) % QueryTokenCache::N];
+            e.cs_type_ = cs_type;
+            e.name_len_ = parser_name.length();
+            e.props_len_ = parser_properties.length();
+            e.text_len_ = search_text_string.length();
+            if (e.name_len_ > 0) {
+              MEMCPY(e.name_, parser_name.ptr(), e.name_len_);
+            }
+            if (e.props_len_ > 0) {
+              MEMCPY(e.props_, parser_properties.ptr(), e.props_len_);
+            }
+            if (e.text_len_ > 0) {
+              MEMCPY(e.text_, search_text_string.ptr(), e.text_len_);
+            }
+            e.token_cnt_ = static_cast<int32_t>(query_tokens.count());
+            int32_t off = 0;
+            for (int64_t i = 0; i < query_tokens.count(); ++i) {
+              const ObString &t = query_tokens.at(i);
+              e.tok_off_[i] = off;
+              e.tok_len_[i] = t.length();
+              if (t.length() > 0) {
+                MEMCPY(e.tok_buf_ + off, t.ptr(), t.length());
+              }
+              off += t.length();
+            }
+            e.valid_ = true;
+          }
         }
       }
     }
